@@ -1,4 +1,4 @@
-# ProseLens
+﻿# ProseLens
 
 Paste a chapter, get it back as natural English.
 
@@ -19,7 +19,7 @@ text is never overwritten. Built mobile-first.
 | Language | TypeScript (strict) |
 | Styling | Tailwind CSS v4 |
 | Animation | GSAP + `@gsap/react` |
-| Error monitoring | Sentry (`@sentry/nextjs`) — scaffolded, inert until a DSN is set |
+| Error monitoring | Sentry (`@sentry/nextjs`) â€” scaffolded, inert until a DSN is set |
 | Build / package manager | Bun 1.3.4 |
 | Runtime | Node 20 |
 | Container | Docker, multi-stage, `node server.js` |
@@ -96,8 +96,8 @@ against the endpoint this app is configured for.
 ### Choosing a model per run
 
 The model row sits under the key field. It lists only the models the configured
-provider can serve — the GPT models for an OpenAI key, the Gemini models for a
-Gemini key — and whatever you select is sent with that request. The list is
+provider can serve â€” the GPT models for an OpenAI key, the Gemini models for a
+Gemini key â€” and whatever you select is sent with that request. The list is
 served whether or not a key is set, so the choice is available before you
 paste one.
 
@@ -138,8 +138,8 @@ the pass.
 | Route | Purpose |
 |---|---|
 | `/` | The editor |
-| `/api/correct` | `POST` — runs the correction pipeline |
-| `/api/health` | `GET` — liveness probe, reports whether the LLM is configured and which models it can reach |
+| `/api/correct` | `POST` â€” runs the correction pipeline |
+| `/api/health` | `GET` â€” liveness probe, reports whether the LLM is configured and which models it can reach |
 | 404 | Not-found page |
 
 ## Scripts
@@ -204,10 +204,10 @@ so a passing run also proves the system prompt and payload shape are correct.
 
 `lib/engine.ts` chooses between two paths:
 
-1. **LLM path** — when a key is available, either from the request or the
+1. **LLM path** â€” when a key is available, either from the request or the
    environment, `lib/llm.ts` runs the chapter through both passes described
    below.
-2. **Local path** — `lib/local-engine.ts` applies high-confidence rules only. It
+2. **Local path** â€” `lib/local-engine.ts` applies high-confidence rules only. It
    never guesses at style.
 
 A provider failure (bad key, timeout, unparseable response, HTTP error) falls
@@ -219,7 +219,7 @@ The editor runs the pipeline at fixed settings. Tone is `polished`, point of
 view is `detect`, and every issue category is checked. The components for
 choosing those are still in the tree, along with the pipeline strip, speaker
 list, continuity list, summary strip, suggestion cards, and the story-bible
-panel, which currently ship in the source but are not rendered — re-rendering
+panel, which currently ship in the source but are not rendered â€” re-rendering
 any of them is a matter of adding the element back to `components/editor/editor.tsx`.
 
 ### Two passes, always
@@ -365,6 +365,6 @@ drawn on the page.
 
 The chapter is sent to the configured provider for a single pass and discarded.
 A key pasted into the page stays in that browser's local storage and is never
-written to a database or a log; no manuscript content and no key reach Sentry —
+written to a database or a log; no manuscript content and no key reach Sentry â€”
 the `beforeSend` hook strips request bodies and cookies. The site works with no
 account and no cookies.
