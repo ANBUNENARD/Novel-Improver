@@ -10,7 +10,7 @@ export default function NotFound() {
       <p className="mt-3 text-ink-400">
         The link may be stale, or the page may have moved during a rewrite.
       </p>
-      <Link href="/#editor" className="btn-primary mt-8">
+      <Link href="/" className="btn-primary mt-8">
         Back to the editor
       </Link>
     </div>

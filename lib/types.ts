@@ -2,11 +2,11 @@
  * Shared types for the correction pipeline.
  *
  * The shape below is the contract between the API route, the engine, and the
- * editor UI. Keep it stable: the client renders `suggestions` and `corrected`
- * directly, so renaming a field is a breaking change across all three.
+ * editor UI. Keep it stable: the client renders `changes` directly, so renaming
+ * a field is a breaking change across all three.
  */
 
-/** Categories surfaced as filter chips in the editor. */
+/** Categories the analyst pass can report on. */
 export type IssueCategory =
   | "grammar"
   | "spelling"
@@ -43,18 +43,6 @@ export const CATEGORY_LABELS: Record<IssueCategory, string> = {
 export type PovMode = "off" | "detect" | "enforce";
 
 export const POV_MODES: PovMode[] = ["off", "detect", "enforce"];
-
-export const POV_MODE_LABELS: Record<PovMode, string> = {
-  off: "Off",
-  detect: "Detect",
-  enforce: "Fix",
-};
-
-export const POV_MODE_DESCRIPTIONS: Record<PovMode, string> = {
-  off: "Skip point-of-view analysis.",
-  detect: "Flag unclear speakers and POV slips without changing any text.",
-  enforce: "Also rewrite the narration that has a provably wrong speaker.",
-};
 
 /** One dialogue line and who the checker believes is speaking it. */
 export interface SpeakerNote {
@@ -102,13 +90,6 @@ export const TONE_LABELS: Record<TonePreset, string> = {
   polished: "Polished",
   concise: "Concise",
   engaging: "Engaging",
-};
-
-export const TONE_DESCRIPTIONS: Record<TonePreset, string> = {
-  faithful: "Fix errors, change nothing else.",
-  polished: "Improve flow and rhythm, keep the author's voice.",
-  concise: "Cut redundancy and tighten sentences.",
-  engaging: "Sharpen openings and vary sentence length.",
 };
 
 /** One kind of established fact the continuity layer can hold. */
@@ -175,58 +156,54 @@ export interface ContinuityNote {
   note?: string;
 }
 
-/** The ten stages of the web-novel polishing pass, in the order they run. */
-export const PIPELINE_STAGES = [
-  "parse",
-  "pov",
-  "normalize",
-  "continuity",
-  "meaning",
-  "rewrite",
-  "pacing",
-  "dialogue",
-  "logic",
-  "consistency",
-] as const;
-
-export type PipelineStage = (typeof PIPELINE_STAGES)[number];
-
-export const PIPELINE_STAGE_LABELS: Record<PipelineStage, string> = {
-  parse: "Parse",
-  pov: "POV",
-  normalize: "Names",
-  continuity: "Continuity",
-  meaning: "Meaning",
-  rewrite: "Rewrite",
-  pacing: "Pacing",
-  dialogue: "Dialogue",
-  logic: "Logic",
-  consistency: "Final check",
-};
-
-export const PIPELINE_STAGE_DESCRIPTIONS: Record<PipelineStage, string> = {
-  parse: "Narration, dialogue, thoughts, actions, and scene breaks identified.",
-  pov: "Who narrates, who thinks, and who speaks each line.",
-  normalize: "Names, aliases, titles, and genders read against the story bible.",
-  continuity: "Names, identities, terms, and relationships checked for drift.",
-  meaning: "Broken literal translations read for what the author intended.",
-  rewrite: "Awward literal phrasing rewritten as natural English.",
-  pacing: "Paragraph length and the action-to-consequence rhythm.",
-  dialogue: "Speaker tags, replies, and character voice checked.",
-  logic: "Actions, reactions, and consequences put in order.",
-  consistency: "A last pass over POV, names, terms, and plot preservation.",
-};
-
-/** One stage and what it found. Drives the strip above the result. */
-export interface PipelineReportEntry {
-  stage: PipelineStage;
-  /** One short line describing what the stage did, shown on hover. */
-  detail?: string;
-  /** False when the stage was skipped because the matching control was off. */
-  ran: boolean;
+/**
+ * One thing the analyst found in a chapter.
+ *
+ * The notes are what makes a two-pass rewrite better than one big prompt: the
+ * rewriter is told what each paragraph got wrong before it writes, and the
+ * reader can see the reasoning next to the change.
+ */
+export interface AnalysisNote {
+  /** Zero-based paragraph index this applies to. */
+  paragraph: number;
+  category: IssueCategory;
+  /** Short imperative description, e.g. "Drop the translator's filler". */
+  title: string;
+  /** A short exact phrase copied from that paragraph. */
+  excerpt: string;
+  /** What the author meant, in one sentence. */
+  intended: string;
+  /** Replacement wording for the excerpt. Empty when the paragraph needs a fuller rewrite. */
+  rewrite: string;
 }
 
-/** One flagged passage. `original` is echoed back for the side-by-side diff. */
+/**
+ * One paragraph's change, as the side-by-side view renders it.
+ *
+ * `before` is the reader's own text and `after` is the rewrite. A reader keeps
+ * or undoes each one independently, so the final export is assembled from
+ * whatever they chose.
+ */
+export interface Change {
+  /** Position in the original chapter, starting at zero. */
+  index: number;
+  /** The paragraph as the reader pasted it. */
+  before: string;
+  /** The paragraph as the model rewrote it. */
+  after: string;
+  /** True when the rewrite left this paragraph alone. */
+  unchanged: boolean;
+  /** Findings the analyst reported against this paragraph. */
+  notes: AnalysisNote[];
+}
+
+/**
+ * One flagged passage from a rule the engine applies without a model.
+ *
+ * This never reaches the reader directly. The rules engine collects these while
+ * it edits, and `pairWithSuggestions` folds them into the `Change` entries the
+ * side-by-side view renders.
+ */
 export interface Suggestion {
   id: string;
   category: IssueCategory;
@@ -238,35 +215,35 @@ export interface Suggestion {
   suggestion: string;
   /** Optional one-sentence rationale shown under the title. */
   note?: string;
-}
-
-/** Aggregate counts for the summary strip above the editor. */
-export interface AnalysisSummary {
-  wordCount: number;
-  sentenceCount: number;
-  averageSentenceLength: number;
-  readability: {
-    score: number;
-    label: string;
-  };
-  issuesByCategory: Partial<Record<IssueCategory, number>>;
+  /**
+   * Where the text sat in the input before the edit, as a character offset.
+   *
+   * The rules engine edits in place and never renumbers, so this is what places
+   * a finding on the right paragraph once a rewrite has moved the text around.
+   */
+  at?: number;
 }
 
 export interface CorrectionResult {
-  /** The rewritten text in full. */
+  /** The rewritten chapter in full, with every accepted change applied. */
   corrected: string;
-  suggestions: Suggestion[];
-  summary: AnalysisSummary;
-  /** Speaker attribution, present when pov mode is "detect" or "enforce". */
-  speakers?: SpeakerNote[];
+  /** One entry per original paragraph, for the side-by-side view. */
+  changes: Change[];
   /** Alias and identity resolutions found against the story bible. */
-  continuity?: ContinuityNote[];
-  /** What each stage of the polishing pass did on this run. */
-  pipeline?: PipelineReportEntry[];
+  continuity: ContinuityNote[];
+  /** Speaker attribution, present when pov mode is "detect" or "enforce". */
+  speakers: SpeakerNote[];
   /** `"llm"` when a model produced the rewrite, `"rules"` for the local fallback. */
   engine: "llm" | "rules";
   model?: string;
-  /** Populated when the LLM call failed and the local engine took over. */
+  /** How many provider requests this chapter needed. */
+  requests: number;
+  /**
+   * Populated when the model call failed and the local engine took over.
+   *
+   * The result is still usable, so this is a warning rather than an error, and
+   * the editor shows it prominently instead of quietly downgrading the work.
+   */
   fallbackReason?: string;
 }
 

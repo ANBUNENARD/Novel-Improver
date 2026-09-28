@@ -54,7 +54,7 @@ export function KeyField({ value, onChange }: KeyFieldProps) {
     <div>
       <div className="mb-1.5 flex items-baseline justify-between gap-3">
         <label htmlFor="api-key" className="text-[11px] uppercase tracking-wider text-ink-500">
-          OpenAI key
+          API key
         </label>
         <span className="text-[11px] text-ink-500">saved in this browser only</span>
       </div>

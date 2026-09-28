@@ -245,14 +245,27 @@ async function main() {
 
     const pageText = () => evaluate("document.body.innerText") as Promise<string>;
 
+    /**
+     * Waits for the run to settle.
+     *
+     * The spinner is the only thing on the page while the request is in flight,
+     * and it is replaced by the paragraph cards either way, so both outcomes are
+     * caught by watching for its disappearance. Falling back on the error alert
+     * is what keeps a rejected run from sitting here until the deadline.
+     */
     const runCheck = async () => {
       await clickByText("button", "Improve this chapter");
       const deadline = Date.now() + 30000;
       for (;;) {
-        const done = await evaluate(
-          `Boolean(document.querySelector('section[aria-live] [class*="whitespace-pre-wrap"]'))`,
-        );
-        if (done === true) return;
+        const state = await evaluate(`(() => {
+          const live = document.querySelector('section[aria-live]');
+          if (!live) return 'no output';
+          if (live.querySelector('[role="alert"]')) return 'error';
+          if (live.querySelector('[data-change]')) return 'done';
+          if (live.querySelector('.animate-spin')) return 'loading';
+          return 'idle';
+        })()`);
+        if (state === "done" || state === "error") return state as string;
         if (Date.now() > deadline) {
           const visible = await pageText();
           throw new Error(`check never finished. visible: ${visible.slice(0, 600)}`);
@@ -260,6 +273,46 @@ async function main() {
         await new Promise((r) => setTimeout(r, 250));
       }
     };
+
+    /** Waits for any run in flight to render its paragraphs. */
+    const waitForOutput = async () => {
+      const deadline = Date.now() + 30000;
+      for (;;) {
+        const ready = await evaluate(
+          `Boolean(document.querySelector('[data-change]')) && !document.querySelector('.animate-spin')`,
+        );
+        if (ready === true) return;
+        if (Date.now() > deadline) return;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    };
+
+    /**
+     * The per-paragraph cards the side-by-side view is built from.
+     *
+     * `textContent` is read rather than `innerText`: the card is off-screen when
+     * it is read, and `innerText` resolves to what is laid out, so it drops the
+     * columns that are scrolled out of view.
+     */
+    const cards = async () =>
+      (await evaluate(
+        `[...document.querySelectorAll('[data-change]')].map((n) => ({
+          index: Number(n.getAttribute('data-change')),
+          unchanged: n.getAttribute('data-unchanged') === 'true',
+          kept: n.getAttribute('data-kept') === 'true',
+          text: n.textContent,
+        }))`,
+      )) as Array<{ index: number; unchanged: boolean; kept: boolean; text: string }>;
+
+    /** The keep control on one paragraph card, by its index. */
+    const toggleFor = (index: number) =>
+      evaluate(`(() => {
+        const card = document.querySelector('[data-change="${index}"]');
+        const b = card ? [...card.querySelectorAll('button')][0] : null;
+        if (!b) return null;
+        b.click();
+        return b.getAttribute('aria-pressed');
+      })()`);
 
     const setViewport = async (width: number, height: number, mobile: boolean) => {
       await send("Emulation.setDeviceMetricsOverride", {
@@ -346,7 +399,7 @@ async function main() {
     // ------------------------------------------------------- key and model row
     console.log("\napi key and model row");
     const controlsText = await pageText();
-    check("the key field is labelled", controlsText.includes("OpenAI key"), controlsText.slice(0, 200));
+    check("the key field is labelled", controlsText.includes("API key"), controlsText.slice(0, 200));
     check(
       "the key field says where the key is kept",
       controlsText.includes("saved in this browser only"),
@@ -482,21 +535,21 @@ async function main() {
     await new Promise((r) => setTimeout(r, 400));
 
     const afterRun = await pageText();
-    // The provider's rewrite, not the pasted text. Asserting against a sentence
-    // the model actually wrote is what proves the output came from the run.
+    // The provider rewrites the pasted errors rather than the whole sentence, so
+    // the rewrite is asserted on the specific words it changed.
     check(
       "the improved chapter is rendered",
-      afterRun.includes("She received the letter"),
+      afterRun.includes("she had received the letter"),
       afterRun.slice(-300),
     );
     check(
       "the improved chapter is not the pasted text",
-      afterRun.includes("It was a quiet morning. She received the letter"),
+      afterRun.includes("It was a quiet morning and she had received the letter"),
       afterRun.slice(-300),
     );
     check(
-      "the run says the pasted text is untouched",
-      afterRun.includes("untouched"),
+      "the pasted text is still shown as the original",
+      afterRun.includes("It were a quiet morning"),
       afterRun.slice(-300),
     );
     check(
@@ -512,6 +565,165 @@ async function main() {
       "no fallback notice is shown on a clean run",
       !afterRun.toLowerCase().includes("falling back"),
       afterRun.slice(-300),
+    );
+
+    // ------------------------------------------------------- the side-by-side view
+    console.log("\nside-by-side view");
+
+    const rows = await cards();
+    check("one card per pasted paragraph", rows.length === 1, `cards=${rows.length}`);
+    check(
+      "the card holds the reader's own words beside the rewrite",
+      rows[0]?.text.includes("It were a quiet morning and she had recieved the letter that morning.") &&
+        rows[0]?.text.includes("It was a quiet morning and she had received the letter that morning."),
+      rows[0]?.text,
+    );
+    check(
+      "both columns are labelled",
+      rows[0]?.text.includes("Original") && rows[0]?.text.includes("Rewritten"),
+      rows[0]?.text,
+    );
+    check(
+      "a rewritten paragraph starts kept",
+      rows[0]?.kept === true && rows[0]?.unchanged === false,
+      JSON.stringify(rows[0]),
+    );
+    check(
+      "the count says what changed",
+      (await pageText()).includes("1 of 1 paragraphs rewritten"),
+      (await pageText()).match(/\d+ of \d+ paragraphs rewritten/)?.[0] ?? "no count",
+    );
+    check(
+      "the analyst's findings sit under the change they explain",
+      rows[0]?.text.includes("Fix the verb form"),
+      rows[0]?.text,
+    );
+
+    // Undoing a paragraph has to change what Copy and Download export, which
+    // is the whole reason the control exists.
+    //
+    // The clipboard is replaced with a recorder that hands back a promise, so
+    // the click can be driven from outside and the captured text read after the
+    // handler has settled. Reading it synchronously would race the handler.
+    const exported = async () => {
+      await evaluate(`(() => {
+        window.__copied = null;
+        if (!window.__realClipboard) {
+          window.__realClipboard = navigator.clipboard.writeText.bind(navigator.clipboard);
+        }
+        navigator.clipboard.writeText = (t) => { window.__copied = t; return Promise.resolve(); };
+        const b = [...document.querySelectorAll('button')]
+          .find((n) => n.textContent.trim() === 'Copy' || n.textContent.trim() === 'Copied');
+        if (b) b.click();
+      })()`);
+      for (let i = 0; i < 40; i += 1) {
+        const value = await evaluate(`window.__copied`);
+        if (typeof value === "string") return value;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return null;
+    };
+
+    const keptExport = await exported();
+    check(
+      "Copy exports the rewrite while the change is kept",
+      keptExport === "It was a quiet morning and she had received the letter that morning.",
+      String(keptExport),
+    );
+
+    await toggleFor(0);
+    await new Promise((r) => setTimeout(r, 200));
+    check(
+      "undoing a paragraph flips its control",
+      (await evaluate(`document.querySelector('[data-change="0"]').getAttribute('data-kept')`)) === "false",
+    );
+    check(
+      "an undone paragraph reads as undone",
+      (await cards())[0]?.text.includes("Undone"),
+      (await cards())[0]?.text,
+    );
+    check(
+      "the findings for an undone paragraph are withdrawn with it",
+      !(await cards())[0]?.text.includes("Fix the verb form"),
+      (await cards())[0]?.text,
+    );
+
+    const undoneExport = await exported();
+    check(
+      "Copy exports the reader's own wording once the change is undone",
+      undoneExport === PASSAGE,
+      String(undoneExport),
+    );
+
+    await clickByText("button", "Keep all");
+    await new Promise((r) => setTimeout(r, 200));
+    check(
+      "Keep all takes every change back",
+      (await cards()).every((row) => row.kept === true),
+      JSON.stringify((await cards()).map((row) => row.kept)),
+    );
+
+    await clickByText("button", "Undo all");
+    await new Promise((r) => setTimeout(r, 200));
+    check(
+      "Undo all reverses every change",
+      (await cards()).every((row) => !row.kept),
+      JSON.stringify((await cards()).map((row) => row.kept)),
+    );
+    check(
+      "a fully undone chapter exports exactly what was pasted",
+      (await exported()) === PASSAGE,
+      String(await exported()),
+    );
+    await clickByText("button", "Keep all");
+    await new Promise((r) => setTimeout(r, 200));
+
+    // --------------------------------------------------------- fallback notice
+    console.log("\nfallback notice");
+    // A provider that answers with prose leaves the reader a corrected chapter
+    // and an honest label, with a way to try the model again.
+    await fetch(`${MOCK}/__mock/mode?mode=garbage`);
+    await runCheck();
+    await new Promise((r) => setTimeout(r, 300));
+    await waitForOutput();
+    const degraded = await pageText();
+    check(
+      "a failed run still shows a corrected chapter",
+      (await cards()).length === 1,
+      `cards=${(await cards()).length}`,
+    );
+    check(
+      "a failed run says the rules engine answered",
+      degraded.includes("the local rules engine"),
+      degraded.slice(-300),
+    );
+    check(
+      "a failed run explains what went wrong",
+      String(await evaluate(`document.querySelector('[data-testid="fallback-notice"]')?.innerText ?? ""`)).length > 20,
+    );
+    check(
+      "a failed run offers to try the model again",
+      degraded.includes("Try the model again"),
+      degraded.slice(-300),
+    );
+
+    // The retry makes a fresh run, which is two provider requests. The provider
+    // is put back first: the retry is about the app recovering once the provider
+    // does, and leaving the mock failing would only prove it fails twice.
+    // Waiting on a fixed pause would read the page mid-run and assert against
+    // the failure being retried, so the run is waited out like any other.
+    await fetch(`${MOCK}/__mock/mode?mode=ok`);
+    await clickByText("button", "Try the model again");
+    await new Promise((r) => setTimeout(r, 500));
+    await waitForOutput();
+    check(
+      "retrying after a failure reaches the provider once it recovers",
+      (await pageText()).includes("she had received the letter"),
+      (await pageText()).slice(-300),
+    );
+    check(
+      "the fallback notice clears on a clean run",
+      (await evaluate(`document.querySelector('[data-testid="fallback-notice"]') !== null`)) === false,
     );
 
     const sent = await lastProviderCall();
@@ -534,10 +746,18 @@ async function main() {
 
     // A model that does take a temperature must still get one, or the rewrite
     // is not held stable between runs.
-    const takesTemperature = expectedLabels.find((label) => health.llm.models.find((m) => m.label === label)?.id === "gpt-4o-mini") ?? expectedLabels[2];
-    await clickByText("button", takesTemperature);
+    const temperatureLabel = health.llm.models.find((m) => m.id === "gpt-4o-mini")?.label;
+    check("the provider offers a model that takes a temperature", temperatureLabel !== undefined);
+    await clickByText("button", temperatureLabel!);
     await new Promise((r) => setTimeout(r, 200));
+    check(
+      "the clicked model chip is the active one",
+      (await evaluate(
+        `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === ${JSON.stringify(temperatureLabel)})?.getAttribute('aria-pressed')`,
+      )) === "true",
+    );
     await runCheck();
+    await waitForOutput();
     const sentSecond = await lastProviderCall();
     check(
       "a model that takes a temperature is sent one",
@@ -615,9 +835,14 @@ async function main() {
     await type(PASSAGE);
     await new Promise((r) => setTimeout(r, 200));
     await runCheck();
-    await new Promise((r) => setTimeout(r, 500));
+    await waitForOutput();
     const mobileAfter = await pageText();
-    check("the improved chapter renders on mobile", mobileAfter.includes("She received the letter"));
+    check("the improved chapter renders on mobile", mobileAfter.includes("she had received the letter"));
+    check(
+      "the side-by-side view renders on mobile",
+      (await cards()).length === 1,
+      `cards=${(await cards()).length}`,
+    );
 
     const mobileRunOverflow = await evaluate(
       "document.documentElement.scrollWidth - document.documentElement.clientWidth",

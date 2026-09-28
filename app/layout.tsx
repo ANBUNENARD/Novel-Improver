@@ -23,23 +23,24 @@ const siteUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/+$/, "") ?? "";
 export const metadata: Metadata = {
   metadataBase: siteUrl ? new URL(siteUrl) : undefined,
   title: {
-    default: "ProseLens — see what your draft needs",
+    default: "ProseLens — see what your chapter needs",
     template: "%s · ProseLens",
   },
   description:
-    "Paste a chapter and get every grammar slip, vague sentence, and repeated phrase marked up, then read a corrected rewrite beside it.",
+    "Paste a machine-translated chapter and get it back as natural English, with every change shown beside the original so you can keep or undo it.",
   applicationName: "ProseLens",
   openGraph: {
-    title: "ProseLens — see what your draft needs",
+    title: "ProseLens — see what your chapter needs",
     description:
-      "Paste a chapter and get every grammar slip, vague sentence, and repeated phrase marked up, then read a corrected rewrite beside it.",
+      "Paste a machine-translated chapter and get it back as natural English, with every change shown beside the original so you can keep or undo it.",
     type: "website",
     siteName: "ProseLens",
   },
   twitter: {
     card: "summary_large_image",
-    title: "ProseLens — see what your draft needs",
-    description: "Mark up a draft for grammar, clarity, and style, then read a corrected rewrite.",
+    title: "ProseLens — see what your chapter needs",
+    description:
+      "Paste a machine-translated chapter and get it back as natural English, with every change shown beside the original.",
   },
   robots: { index: true, follow: true },
 };

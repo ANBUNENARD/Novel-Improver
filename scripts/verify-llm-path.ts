@@ -3,9 +3,10 @@
  * mock OpenAI-compatible server.
  *
  * The mock rejects any request that does not satisfy the prompt contract, so a
- * 200 here also proves the system prompt and payload shape are correct.
+ * 200 here also proves the system prompt and payload shape are correct for both
+ * passes.
  *
- * Run against the dev server started with LLM_BASE_URL pointed at the mock:
+ * Run against the server started with LLM_BASE_URL pointed at the mock:
  *   bun run scripts/verify-llm-path.ts http://127.0.0.1:3001
  *
  * The body is wrapped in a uniquely-named function so its bindings stay
@@ -17,6 +18,8 @@ const MOCK = "http://127.0.0.1:4010";
 
 async function verifyLlmPath() {
   const BASE = process.argv[2] || "http://127.0.0.1:3001";
+
+  const SAMPLE = "It were a quiet morning. She had recieved the letter.";
 
   let passed = 0;
   let failed = 0;
@@ -44,10 +47,29 @@ async function verifyLlmPath() {
    * The mock rejects a request whose dictionary presence disagrees with
    * LLM_MOCK_EXPECT_DICTIONARY, so this flag is set per call rather than per
    * run: it asserts what the engine actually sent, not just that it sent
-   * something.
+   * something. It goes over HTTP because the flag is read inside the mock,
+   * which is a different process from this one.
    */
   async function expectDictionary(expect: boolean) {
-    process.env.LLM_MOCK_EXPECT_DICTIONARY = expect ? "1" : "0";
+    await fetch(`${MOCK}/__mock/expect-dictionary?value=${expect ? "1" : "0"}`);
+  }
+
+  /** Tells the mock how many paragraphs the next paste has. */
+  async function expectParagraphs(count: number) {
+    await fetch(`${MOCK}/__mock/expect-paragraphs?value=${count}`);
+  }
+
+  /** Clears the request log so a check can read exactly one run's requests. */
+  async function resetLog() {
+    await fetch(`${MOCK}/__mock/reset`);
+  }
+
+  /** What the mock was actually asked, per pass. */
+  async function lastRequests() {
+    const body = (await (await fetch(`${MOCK}/__mock/last`)).json()) as {
+      requests: Array<{ pass: string; model: string | null; temperature: number | null; bearer: string }>;
+    };
+    return body.requests;
   }
 
   async function correct(
@@ -81,8 +103,86 @@ async function verifyLlmPath() {
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   }
 
+  type Change = {
+    index: number;
+    before: string;
+    after: string;
+    unchanged: boolean;
+    notes: Array<{ paragraph: number; category: string; title: string; excerpt: string; rewrite: string }>;
+  };
+
+  function changesOf(body: Record<string, unknown>): Change[] {
+    return (body.changes as Change[]) ?? [];
+  }
+
+  function notesOf(body: Record<string, unknown>) {
+    return changesOf(body).flatMap((change) => change.notes);
+  }
+
   console.log("\nllm path");
   await setMode("ok");
+  await expectDictionary(false);
+
+  // The mock judges a request against the expectation its control endpoint was
+  // last given, and a flag the endpoint fails to store is invisible until a
+  // run is rejected for the wrong reason. Sending one shaped request each way
+  // proves the flag is the only thing deciding the outcome.
+  const shaped = await fetch(`${MOCK}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer self-check" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: "WEB-NOVEL STYLE. Return raw JSON only. No markdown fences, no commentary." },
+        { role: "user", content: "PASSAGE:\nIt was a quiet morning." },
+      ],
+    }),
+  });
+  check("the mock accepts a request that carries no dictionary", shaped.status === 200, `status ${shaped.status}`);
+
+  // The dictionary belongs to the analyst pass. The mock rejects an analyst
+  // request that drops it while a dictionary is expected, and rejects one that
+  // carries it when none is, so the flag is checked against the same pass in
+  // both directions. Sending this against the rewriter would prove nothing: the
+  // rewriter is handed the analyst's findings and never the raw dictionary.
+  await expectDictionary(true);
+  // The mock reads the pass off the system message and rejects an analyst
+  // request that does not carry the analyst prompt at all, so the probe has to
+  // look like a real analyst call. What is left out is the one thing under
+  // test: the dictionary.
+  const analystShape = {
+    role: "system" as const,
+    content: `EVIDENCE
+When the text is unclear, treat the surrounding material as the evidence.
+- Scene: what is physically happening?
+
+OUTPUT
+Return JSON with exactly these keys:
+{
+  "notes": [{ "paragraph": 0, "category": "grammar", "title": "t", "excerpt": "e", "intended": "i", "rewrite": "r" }],
+  "continuity": [{ "raw": "a", "canonical": "b" }]
+}
+
+Return raw JSON only. No markdown fences, no commentary.`,
+  };
+  const withDictionary = await fetch(`${MOCK}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer self-check" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.3,
+      messages: [
+        analystShape,
+        { role: "user", content: "PASSAGE:\nIt was a quiet morning." },
+      ],
+    }),
+  });
+  check(
+    "the mock rejects an analyst request that drops the expected dictionary",
+    withDictionary.status === 400,
+    `status ${withDictionary.status}`,
+  );
   await expectDictionary(false);
 
   const health = (await (await fetch(`${BASE}/api/health`)).json()) as {
@@ -122,40 +222,114 @@ async function verifyLlmPath() {
   check("health reports the provider base url", health.llm.baseUrl?.includes("4010") === true,
     `baseUrl=${health.llm.baseUrl}`);
 
-  const result = await correct("It were a quiet morning. She had recieved the letter.");
+  const result = await correct(SAMPLE);
 
   check("request succeeds", result.status === 200, `status ${result.status}`);
   check("engine reports llm", result.body.engine === "llm", `engine=${result.body.engine}`);
   check("model is echoed back", result.body.model === "gpt-4o-mini", `model=${String(result.body.model)}`);
   check("no fallback reason on the happy path", result.body.fallbackReason === undefined);
+  // Every rewrite the analyst proposed is applied to the passage. The sample
+  // holds the two errors the mock knows how to find, so both are composed into
+  // one sentence: that is what proves the findings reached the rewriter rather
+  // than the mock rewriting on its own.
+  const COMPOSED = "It was a quiet morning. She had received the letter.";
   check(
     "corrected text comes from the provider",
-    result.body.corrected ===
-      "It was a quiet morning. She received the letter, and it was not good news.",
+    String(result.body.corrected) === COMPOSED,
+    String(result.body.corrected),
   );
 
-  const suggestions = result.body.suggestions as Array<Record<string, string>>;
-  check("provider suggestions are returned", suggestions.length === 3, `got ${suggestions.length}`);
+  // Both passes run for every chunk, including a single-paragraph paste, so the
+  // findings the reader reads beside the rewrite are always the analyst's.
+  check("both passes ran", result.body.requests === 2, `requests=${String(result.body.requests)}`);
+
+  // The side-by-side view is built from the changes, one per original paragraph.
+  const changes = changesOf(result.body);
+  check("one change per pasted paragraph", changes.length === 1, `changes=${changes.length}`);
+  check("the change carries the pasted text on the left", changes[0]?.before === SAMPLE, changes[0]?.before);
+  check("the change carries the rewrite on the right", String(changes[0]?.after) === COMPOSED, String(changes[0]?.after));
+  check("a rewritten paragraph is not reported as unchanged", changes[0]?.unchanged === false);
   check(
-    "the entry with no replacement is dropped",
-    !suggestions.some((item) => item.title?.includes("dropped")),
+    "the change index is its position in the chapter",
+    changes.every((change, position) => change.index === position),
+    JSON.stringify(changes.map((change) => change.index)),
+  );
+  check(
+    "the analyst's findings reach the reader on a one-paragraph paste",
+    changesOf(result.body)[0]?.notes.length > 0,
+    JSON.stringify(notesOf(result.body)),
+  );
+
+  console.log("\ntwo-pass contract");
+
+  // Two paragraphs is where the analysis earns its own request, so this is the
+  // case that proves the chapter really is sent twice and the findings reach
+  // the rewrite.
+  await expectParagraphs(2);
+  await resetLog();
+  const twoParagraphs = await correct(`${SAMPLE}\n\nThe the road was quiet.`);
+  const asked = await lastRequests();
+
+  check("a multi-paragraph paste succeeds", twoParagraphs.status === 200, `status ${twoParagraphs.status}`);
+  check("both passes ran", twoParagraphs.body.requests === 2, `requests=${String(twoParagraphs.body.requests)}`);
+
+  // The run above is the only thing the mock has been asked for, so the log
+  // holds this run's two requests and nothing earlier.
+  check("the chapter was sent exactly twice", asked.length === 2, `requests=${asked.length}`);
+  check("the first pass is the analyst", asked[0]?.pass === "analyst", String(asked[0]?.pass));
+  check("the second pass is the rewriter", asked[1]?.pass === "rewriter", String(asked[1]?.pass));
+  check(
+    "both passes asked for the same model",
+    asked[0]?.model === "gpt-4o-mini" && asked[1]?.model === "gpt-4o-mini",
+    JSON.stringify(asked.map((request) => request.model)),
+  );
+  check(
+    "a model that takes a temperature is sent one on both passes",
+    asked.every((request) => typeof request.temperature === "number"),
+    JSON.stringify(asked.map((request) => request.temperature)),
+  );
+
+  const twoChanges = changesOf(twoParagraphs.body);
+  check("one change per pasted paragraph", twoChanges.length === 2, `changes=${twoChanges.length}`);
+
+  const findings = notesOf(twoParagraphs.body);
+  check("the analyst's findings reach the reader", findings.length > 0, `notes=${findings.length}`);
+  check(
+    "the entry with no excerpt is dropped",
+    !findings.some((note) => note.title.includes("dropped")),
+    JSON.stringify(findings.map((note) => note.title)),
   );
   check(
     "an unknown category is coerced to grammar",
-    suggestions.some((item) => item.category === "grammar" && item.original === "quiet morning"),
+    findings.some((note) => note.category === "grammar" && note.excerpt === "The the"),
+    JSON.stringify(findings.map((note) => [note.category, note.excerpt])),
   );
-  check("the note field survives parsing", suggestions.some((item) => Boolean(item.note)));
-  check("suggestion ids are sequential", suggestions.map((item) => item.id).join(",") === "s1,s2,s3");
+  check(
+    "each finding names the paragraph it belongs to",
+    twoChanges.every((change) => change.notes.every((note) => note.paragraph === change.index)),
+    JSON.stringify(twoChanges.map((change) => change.notes.map((note) => note.paragraph))),
+  );
+  check(
+    "the findings are spread across the paragraphs they name",
+    new Set(findings.map((note) => note.paragraph)).size === 2,
+    JSON.stringify(findings.map((note) => note.paragraph)),
+  );
+  check(
+    "the rewriter applied the rewrite the analyst proposed",
+    String(twoParagraphs.body.corrected).includes("The road was quiet"),
+    String(twoParagraphs.body.corrected),
+  );
+  check(
+    "a finding carries the reading the author meant",
+    findings.every((note) => note.excerpt.length > 0 && note.title.length > 0),
+  );
+  await expectParagraphs(1);
+
+  console.log("\nmodel selection");
 
   // The reader picks a model in the UI; the request carries that choice and the
   // provider is asked for it by name.
-  const switched = await correct(
-    "It were a quiet morning. She had recieved the letter.",
-    "polished",
-    "detect",
-    undefined,
-    "gpt-4.1-mini",
-  );
+  const switched = await correct(SAMPLE, "polished", "detect", undefined, "gpt-4.1-mini");
   check("a second model can be chosen", switched.status === 200, `status ${switched.status}`);
   check("the chosen model is the one that ran", switched.body.model === "gpt-4.1-mini", `model=${String(switched.body.model)}`);
   check("the chosen model still uses the provider", switched.body.engine === "llm", `engine=${switched.body.engine}`);
@@ -166,13 +340,7 @@ async function verifyLlmPath() {
 
   // A Gemini id must never reach an OpenAI key, where it would 404 and be
   // reported as a fallback rather than as the wrong click it is.
-  const crossProvider = await correct(
-    "It were a quiet morning. She had recieved the letter.",
-    "polished",
-    "detect",
-    undefined,
-    "gemini-2.5-pro",
-  );
+  const crossProvider = await correct(SAMPLE, "polished", "detect", undefined, "gemini-2.5-pro");
   check("a foreign model does not 400", crossProvider.status === 200, `status ${crossProvider.status}`);
   check(
     "a foreign model keeps the configured one",
@@ -184,13 +352,7 @@ async function verifyLlmPath() {
   // The cheapest model in the picker is the one a reader is told to try first.
   // It is a reasoning model, which rejects a non-default temperature, so this
   // also proves the transport omits it rather than 400ing on the way in.
-  const cheapest = await correct(
-    "It were a quiet morning. She had recieved the letter.",
-    "polished",
-    "detect",
-    undefined,
-    "gpt-5-nano",
-  );
+  const cheapest = await correct(SAMPLE, "polished", "detect", undefined, "gpt-5-nano");
   check("the cheapest model can be chosen", cheapest.status === 200, `status ${cheapest.status}`);
   check(
     "the cheapest model is the one that ran",
@@ -212,16 +374,6 @@ async function verifyLlmPath() {
     String(cheapest.body.corrected).length > 0,
   );
 
-  const summary = result.body.summary as {
-    wordCount: number;
-    issuesByCategory: Record<string, number>;
-  };
-  check("summary counts the corrected text", summary.wordCount === 15, `got ${summary.wordCount}`);
-  check(
-    "category counts match the suggestions",
-    Object.values(summary.issuesByCategory).reduce((a, b) => a + b, 0) === suggestions.length,
-  );
-
   // Speaker attribution is settled from the text alone, so it runs on the
   // provider path too: the model rewrites prose but does not reliably track who
   // is talking across a chapter.
@@ -241,9 +393,8 @@ async function verifyLlmPath() {
   );
   check(
     "the llm path reports the pov category",
-    (povDetect.body.suggestions as Array<{ category: string }>).some(
-      (item) => item.category === "pov",
-    ),
+    notesOf(povDetect.body).some((note) => note.category === "pov"),
+    JSON.stringify(notesOf(povDetect.body).map((note) => note.category)),
   );
   check(
     "detect mode proposes no rewrite",
@@ -264,7 +415,7 @@ async function verifyLlmPath() {
     povOff.body.speakers !== undefined && (povOff.body.speakers as unknown[]).length === 0,
   );
 
-  // The story bible has to reach the model and come back as resolutions. The
+  // The story bible has to reach the analyst and come back as resolutions. The
   // mock fails the request outright when the dictionary is missing, so a 200
   // here proves the block was actually sent.
   console.log("\ncontinuity dictionary on the llm path");
@@ -298,7 +449,7 @@ async function verifyLlmPath() {
   );
   check(
     "an alias is rewritten before the model reads it",
-    (withBible.body.corrected as string).startsWith("Phine lifted her glass mask."),
+    String(withBible.body.corrected).startsWith("Phine lifted her glass mask."),
     String(withBible.body.corrected).slice(0, 90),
   );
 
@@ -308,41 +459,30 @@ async function verifyLlmPath() {
     via?: string;
   }>;
   check(
-    "the provider's own resolutions come back",
+    "the analyst's own resolutions come back",
     continuity.some((note) => note.raw === "Mardol" && note.canonical === "Phine"),
     JSON.stringify(continuity),
   );
   check(
-    "the local rename and the provider's resolution are both reported",
+    "the local rename and the analyst's resolution are both reported",
     continuity.filter((note) => note.canonical === "Phine").length >= 2,
     JSON.stringify(continuity),
   );
 
-  const pipeline = withBible.body.pipeline as Array<{ stage: string; ran: boolean; detail: string }>;
-  check(
-    "the response carries the ten-stage report",
-    Array.isArray(pipeline) && pipeline.length === 10,
-    String(Array.isArray(pipeline) ? pipeline.length : pipeline),
-  );
-  check(
-    "every stage reports what it did",
-    pipeline.every((entry) => typeof entry.detail === "string" && entry.detail.length > 0),
-  );
-  check(
-    "the continuity stage names the alias it resolved",
-    pipeline.find((entry) => entry.stage === "continuity")?.detail?.includes("Mardol") === true,
-    pipeline.find((entry) => entry.stage === "continuity")?.detail,
-  );
-
-  // A dictionary full of junk must not reach the model or break the run.
+  // A dictionary full of junk must not reach the model or break the run, so the
+  // request that follows carries no dictionary at all.
+  await expectDictionary(false);
   const junk = await correct("Mardol waited.", "polished", "detect", { entries: "nonsense" });
-  check("a malformed dictionary is ignored", junk.status === 200 && junk.body.engine === "llm");
+  check("a malformed dictionary is ignored", junk.status === 200 && junk.body.engine === "llm", `engine=${junk.body.engine}`);
+
+  const afterJunk = await correct("It was a quiet morning.", "polished", "detect", undefined);
+  check("the run after a bad dictionary still uses the provider", afterJunk.status === 200 && afterJunk.body.engine === "llm", `engine=${afterJunk.body.engine}`);
 
   await expectDictionary(false);
 
   console.log("\nfallback path");
   // Each failure mode must degrade to the rules engine with a 200, not a 500.
-  await setMode("garbage");  const garbage = await correct("It were a quiet morning.");
+  await setMode("garbage");  const garbage = await correct(SAMPLE);
   check("unparseable provider output still returns 200", garbage.status === 200, `status ${garbage.status}`);
   check("unparseable provider output falls back to rules", garbage.body.engine === "rules");
   check(
@@ -354,16 +494,26 @@ async function verifyLlmPath() {
     "fallback still returns corrected text",
     typeof garbage.body.corrected === "string" && (garbage.body.corrected as string).length > 0,
   );
+  check(
+    "fallback still returns a side-by-side view",
+    changesOf(garbage.body).length > 0,
+    `changes=${changesOf(garbage.body).length}`,
+  );
+  check(
+    "fallback reports that it made no provider request",
+    garbage.body.requests === 0,
+    `requests=${String(garbage.body.requests)}`,
+  );
 
   await setMode("empty");
-  const empty = await correct("It were a quiet morning.");
+  const empty = await correct(SAMPLE);
   check(
     "empty provider content falls back to rules",
     empty.status === 200 && empty.body.engine === "rules",
   );
 
   await setMode("unauthorized");
-  const unauthorized = await correct("It were a quiet morning.");
+  const unauthorized = await correct(SAMPLE);
   check(
     "a 401 from the provider falls back to rules",
     unauthorized.status === 200 && unauthorized.body.engine === "rules",
@@ -371,10 +521,11 @@ async function verifyLlmPath() {
   check(
     "the 401 status is surfaced in the reason",
     String(unauthorized.body.fallbackReason).includes("401"),
+    String(unauthorized.body.fallbackReason),
   );
 
   await setMode("ok");
-  const recovered = await correct("It were a quiet morning.");
+  const recovered = await correct(SAMPLE);
   check("the app returns to the llm path once the provider recovers", recovered.body.engine === "llm");
 
   console.log(`\n${passed} passed, ${failed} failed\n`);

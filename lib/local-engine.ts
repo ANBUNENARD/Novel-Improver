@@ -12,9 +12,17 @@
  * is what makes translated Korean webnovel prose read like a transcript.
  */
 
+import { alignParagraphs } from "./diff";
 import { analysePov, applyPovFixes } from "./pov";
 import { countSyllables, countWords, readabilityOf, splitSentences } from "./text-stats";
-import type { AnalysisSummary, IssueCategory, PovMode, SpeakerNote, Suggestion } from "./types";
+import type {
+  AnalysisNote,
+  Change,
+  IssueCategory,
+  PovMode,
+  SpeakerNote,
+  Suggestion,
+} from "./types";
 
 /** High-confidence contractions. Each entry is [pattern, replacement]. */
 const CONTRACTIONS: Array<[RegExp, string]> = [
@@ -97,6 +105,7 @@ function pushSuggestion(
   original: string,
   replacement: string,
   note?: string,
+  at?: number,
 ): void {
   if (original === replacement) return;
 
@@ -107,6 +116,7 @@ function pushSuggestion(
     original,
     suggestion: replacement,
     note,
+    at,
   });
 }
 
@@ -193,15 +203,19 @@ function fixText(text: string, tone: string, suggestions: Suggestion[]): string 
   if (tone === "concise" || tone === "engaging") {
     for (const word of FILLER_WORDS) {
       const pattern = new RegExp(`\\b${word}\\s+`, "gi");
-      result = result.replace(pattern, (match) => {
-        const original = match.trimEnd();
+      result = result.replace(pattern, (match, offset: number) => {
+        // The word is about to leave the text, so the finding is anchored on
+        // the empty string at its old position. Pairing looks for that anchor,
+        // which puts the finding on this paragraph and no other.
+        const here = offset;
         pushSuggestion(
           suggestions,
           "style",
           "Cut the intensifier",
-          original,
           "",
-          "This word adds length without changing the meaning.",
+          "",
+          `\`${match.trim()}\` adds length without changing the meaning.`,
+          here,
         );
         return "";
       });
@@ -267,30 +281,10 @@ function findSentenceIssues(
     }
   });
 }
-
-function summarise(text: string, suggestions: Suggestion[]): AnalysisSummary {
-  const sentences = splitSentences(text);
-  const words = countWords(text);
-  const readability = readabilityOf(text);
-
-  const issuesByCategory: Partial<Record<IssueCategory, number>> = {};
-  for (const suggestion of suggestions) {
-    issuesByCategory[suggestion.category] = (issuesByCategory[suggestion.category] ?? 0) + 1;
-  }
-
-  return {
-    wordCount: words,
-    sentenceCount: sentences.length,
-    averageSentenceLength: sentences.length > 0 ? Math.round((words / sentences.length) * 10) / 10 : 0,
-    readability,
-    issuesByCategory,
-  };
-}
-
 export interface LocalResult {
   corrected: string;
-  suggestions: Suggestion[];
-  summary: AnalysisSummary;
+  /** One entry per original paragraph, for the side-by-side view. */
+  changes: Change[];
   /** Per-line speaker notes, so the editor can show who is talking. */
   speakers: SpeakerNote[];
 }
@@ -309,7 +303,7 @@ export function correctLocally(
 
   // POV runs after the text rules so the offsets it recorded still line up with
   // the text being edited. In enforce mode the removed tags are written back
-  // before the summary is taken, so the word count reflects the improved text.
+  // before the changes are paired, so the view reflects the improved text.
   let improved = corrected;
   const pov = povMode === "off" ? null : analysePov(corrected, povMode);
   const speakers = pov?.speakers ?? [];
@@ -318,21 +312,84 @@ export function correctLocally(
     improved = applyPovFixes(corrected, speakers);
   }
 
-  const all = suggestions.concat(pov?.suggestions ?? []);
-
   // Long sentences are only worth flagging when the user opted into structure.
-  if (!active.has("structure") && !active.has("style")) {
-    return {
-      corrected: improved,
-      suggestions: all.filter(
-        (item) => item.category !== "structure" && item.category !== "style",
-      ),
-      summary: summarise(improved, all),
-      speakers,
-    };
-  }
+  const keep = suggestions.concat(pov?.suggestions ?? []);
+  const visible = active.has("structure") || active.has("style")
+    ? keep
+    : keep.filter((item) => item.category !== "structure" && item.category !== "style");
 
-  return { corrected: improved, suggestions: all, summary: summarise(improved, all), speakers };
+  return { corrected: improved, changes: pairWithSuggestions(text, improved, visible), speakers };
+}
+
+/**
+ * Pairs each original paragraph with its rewrite and attaches the findings that
+ * were reported against it.
+ *
+ * The rules engine edits in place and never adds or removes a paragraph, so the
+ * pairing is positional and every original paragraph keeps a partner.
+ *
+ * A finding is placed by offset. A fix that changed length moved its text, so
+ * the offset is walked forward by each edit's own length difference to find the
+ * quote in the rewrite. A fix that removed its quote outright leaves nothing to
+ * find and is placed on the paragraph that edit happened in. Either way a
+ * finding lands on one row, and a quote running loose across a paragraph
+ * boundary cannot settle on the first paragraph that contains it.
+ */
+function pairWithSuggestions(
+  before: string,
+  after: string,
+  suggestions: Suggestion[],
+): Change[] {
+  const pairs = alignParagraphs(before, after);
+  const rewrites = pairs.map((pair) => pair.after ?? pair.before);
+  const claimed = new Set<Suggestion>();
+
+  // Where each edit left the text, so a later quote is found past the ones
+  // that already moved.
+  const offsets: number[] = suggestions.map((item) =>
+    item.at === undefined ? 0 : item.suggestion.length - item.original.length,
+  );
+
+  const notes: AnalysisNote[][] = pairs.map(() => []);
+
+  suggestions.forEach((item, position) => {
+    const searchFrom = Math.max(0, item.at ?? 0) + offsets[position];
+    const paragraph = rewrites.findIndex(
+      (text, index) => index >= searchFrom || text.includes(item.original),
+    );
+
+    // A finding with no place of its own is placed on the paragraph whose
+    // rewrite still holds its quote, and otherwise on the first paragraph
+    // the reader pasted it into.
+    const target =
+      paragraph === -1
+        ? pairs.findIndex((pair) => pair.before.includes(item.original))
+        : paragraph;
+
+    if (target === -1 || claimed.has(item)) return;
+    claimed.add(item);
+    notes[target].push(toNote(target, item));
+  });
+
+  return pairs.map((pair, index) => ({
+    index: pair.index,
+    before: pair.before,
+    after: pair.after ?? pair.before,
+    unchanged: pair.unchanged,
+    notes: notes[index],
+  }));
+}
+
+/** Adapts a rule's finding into the shape the side-by-side view renders. */
+function toNote(paragraph: number, item: Suggestion): AnalysisNote {
+  return {
+    paragraph,
+    category: item.category,
+    title: item.title,
+    excerpt: item.original,
+    intended: item.note ?? "The literal wording needs correcting.",
+    rewrite: item.suggestion,
+  };
 }
 
 /** Exposed for the engine's self-test. */

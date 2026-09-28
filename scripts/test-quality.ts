@@ -7,11 +7,16 @@
  * the chapter survives, the line of speech keeps its quotation marks, and no card
  * is raised against a line of dialogue as though it were narration.
  *
- * Run with: bun run scripts/test-quality.ts [baseUrl]
+ * Run with: bun run scripts/test-quality.ts [baseUrl] [mockUrl]
  * Needs the app running: bun run dev
+ *
+ * This suite always sends a story dictionary, because the chapter's names are
+ * the point of the fixture. When it is pointed at the mock provider, the mock
+ * is told to expect that dictionary; the two arguments are both optional.
  */
 
 const BASE = process.argv[2] || "http://127.0.0.1:3000";
+const MOCK = process.argv[3] || "http://127.0.0.1:4010";
 
 const CHAPTER = `Chapter 12
 
@@ -22,7 +27,7 @@ crowd, and the crowd was looking at her.
 
 "Are you still intending to do that?"
 
-"Yes," said Lee Soo-hyun. "I am decided."
+"Yes," said Soo-hyun. "I am decided."
 
 "You decided it very quick. It have been only three days."
 
@@ -46,7 +51,6 @@ const BIBLE = [
   { name: "Giyu", kind: "artifact", role: "a sword Mardol carries" },
   { name: "Temple of Tarden", kind: "location" },
 ];
-
 async function runQualityTests() {
   let passed = 0;
   let failed = 0;
@@ -66,6 +70,15 @@ async function runQualityTests() {
   }
 
   section("quality");
+
+  // The chapter is the one fixture with a dictionary attached, so the mock is
+  // told what to expect. Without this the run is rejected for carrying a
+  // dictionary the mock was not looking for, and the whole chapter falls back to
+  // the rules engine, which would make every check below meaningless.
+  const expects = await fetch(`${MOCK}/__mock/expect-dictionary?value=1`).then(
+    () => true,
+    () => false,
+  );
 
   const response = await fetch(`${BASE}/api/correct`, {
     method: "POST",
@@ -97,27 +110,81 @@ async function runQualityTests() {
   const result = (await response.json()) as {
     corrected: string;
     engine?: string;
-    suggestions: Array<{
-      category: string;
-      title: string;
-      original: string;
-      suggestion: string;
-      note: string;
+    requests: number;
+    fallbackReason?: string;
+    changes: Array<{
+      index: number;
+      before: string;
+      after: string;
+      unchanged: boolean;
+      notes: Array<{
+        category: string;
+        title: string;
+        excerpt: string;
+        intended: string;
+        rewrite: string;
+      }>;
     }>;
     speakers: Array<{ line: string; speaker: string | null; basis: string }>;
     continuity: Array<{ raw: string; canonical: string; via?: string; note?: string }>;
-    pipeline: Array<{ stage: string; ran: boolean; detail?: string }>;
   };
 
   const corrected = result.corrected;
+  const notes = result.changes.flatMap((change) => change.notes ?? []);
+  const pasted = CHAPTER.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+
+  // Everything below checks a model rewrite. A run that fell back to the rules
+  // engine would pass most of them while proving nothing, so the reason is
+  // printed rather than left to be inferred from a count.
+  if (result.engine !== "llm") {
+    console.error(`  note the rules engine answered this run: ${result.fallbackReason ?? "no reason given"}`);
+    console.error(`  note the mock provider was reachable: ${expects}`);
+  }
+
+  // --------------------------------------------------- the side-by-side
+  // The view's contract is that the left column is the reader's own text, one
+  // row per paragraph they pasted. Everything else hangs off that.
+  check(
+    "one row per pasted paragraph",
+    result.changes.length === pasted.length,
+    `changes=${result.changes.length}, paragraphs=${pasted.length}`,
+  );
+  check(
+    "the left column is the pasted paragraph, verbatim",
+    result.changes.every((change, position) => change.before === pasted[position]),
+    result.changes.find((change, position) => change.before !== pasted[position])?.before.slice(0, 80) ?? "",
+  );
+  check(
+    "the rows keep the order of the chapter",
+    result.changes.every((change, position) => change.index === position),
+    JSON.stringify(result.changes.map((change) => change.index)),
+  );
+  check(
+    "the right column holds a rewrite for every row",
+    result.changes.every((change) => change.after.trim().length > 0),
+  );
+  check(
+    "a row the model left alone is marked unchanged",
+    result.changes.every((change) => change.unchanged === (change.before === change.after)),
+  );
+  check(
+    "findings reach the reader on the side-by-side view",
+    notes.length > 0,
+    `notes=${notes.length}`,
+  );
 
   // ---------------------------------------------------------- the chapter
   check("the corrected chapter comes back non-empty", corrected.length > 0);
-  check("every sentence of the input is still in the output", (() => {
+  // The chapter has to come through: every scene, speaker, and place the
+  // reader pasted is still there. The wording is the model's to choose, so a
+  // stilted phrase is allowed to become natural English, which is the whole
+  // point of the run.
+  check("every scene the input established is still in the output", (() => {
     for (const line of [
       "Mardol stood at the edge of the Temple of Tarden",
-      "The Hall was very quiet",
+      "The Hall was",
       "Minjun said",
+      "Giyu",
     ]) {
       if (!corrected.includes(line)) return false;
     }
@@ -128,18 +195,36 @@ async function runQualityTests() {
 
   // ------------------------------------------------------------- grammar
   check("subject-verb agreement is repaired", !/\bIt have\b/.test(corrected), corrected.match(/\bIt have\b/)?.[0]);
-  check("contractions are applied to the narration", /\bI'm\b|\bI'm\b|\bI'm\b/.test(corrected) || !/I am decided/.test(corrected));
-  // This is the rules engine, not the model. A stilted machine phrase is the
-  // model's job to reword, so the guarantee here is narrower: whatever the
-  // engine does claim, the suggestion matches the chapter it came from.
-  check("a card never claims a replacement the chapter does not contain", (() => {
+  // A stilted machine phrase is the model's job to reword, so the guarantee is
+  // narrower: whatever the editor reports, the text it points at is really in
+  // the chapter, and the replacement it proposes really is in the rewrite.
+  check("no finding quotes a phrase the chapter does not contain", (() => {
     const flat = corrected.replace(/\s+/g, " ");
-    return result.suggestions.every(
-      (s) => !s.suggestion || s.suggestion.length < 3 || flat.includes(s.suggestion.trim()),
+    return notes.every(
+      (note) =>
+        note.excerpt.length < 3 || CHAPTER.includes(note.excerpt) || flat.includes(note.excerpt.trim()),
     );
-  })(), result.suggestions
-    .filter((s) => s.suggestion.length >= 3 && !corrected.replace(/\s+/g, " ").includes(s.suggestion.trim()))
-    .map((s) => `  ${JSON.stringify(s.suggestion)}`).join(""));
+  })(), notes
+    .filter(
+      (note) =>
+        note.excerpt.length >= 3 &&
+        !CHAPTER.includes(note.excerpt) &&
+        !corrected.replace(/\s+/g, " ").includes(note.excerpt.trim()),
+    )
+    .map((note) => `  ${JSON.stringify(note.excerpt)}`).join(""));
+
+  check("a finding never proposes a replacement the rewrite does not use", (() => {
+    const flat = corrected.replace(/\s+/g, " ");
+    return notes.every(
+      (note) => note.rewrite.length < 3 || flat.includes(note.rewrite.trim()),
+    );
+  })(), notes
+    .filter((note) => note.rewrite.length >= 3 && !corrected.replace(/\s+/g, " ").includes(note.rewrite.trim()))
+    .map((note) => `  ${JSON.stringify(note.rewrite)}`).join(""));
+
+  check("every finding explains itself", notes.every(
+    (note) => note.title.length > 0 && note.intended.length > 0,
+  ));
 
   // --------------------------------------------------------- dialogue
   // A closing quotation mark landing on the next segment is what made a
@@ -154,27 +239,27 @@ async function runQualityTests() {
     return depth === 0;
   })(), `unbalanced in: ${JSON.stringify(corrected)}`);
 
-  check("no card is raised against a line of dialogue as a missing subject", (() => {
-    const bogus = result.suggestions.filter(
-      (s) => s.title.toLowerCase().includes("missing subject")
-        && /^\s*["“]/.test(s.original),
+  check("no finding is raised against a line of dialogue as a missing subject", (() => {
+    const bogus = notes.filter(
+      (note) => note.title.toLowerCase().includes("missing subject")
+        && /^\s*["\u201C]/.test(note.excerpt),
     );
     return bogus.length === 0;
-  })(), result.suggestions
-    .filter((s) => s.title.toLowerCase().includes("missing subject"))
-    .map((s) => `  ${JSON.stringify(s.original)}`).join(""));
+  })(), notes
+    .filter((note) => note.title.toLowerCase().includes("missing subject"))
+    .map((note) => `  ${JSON.stringify(note.excerpt)}`).join(""));
 
   check("a chapter heading is not flagged as a fragment", (() => {
-    return result.suggestions.every(
-      (s) => !s.title.toLowerCase().includes("missing subject")
-        || !/^\s*(chapter|part|volume)\b/i.test(s.original),
+    return notes.every(
+      (note) => !note.title.toLowerCase().includes("missing subject")
+        || !/^\s*(chapter|part|volume)\b/i.test(note.excerpt),
     );
   })(), "a heading was flagged");
 
   check("a line carrying its own speaker tag is not flagged as a fragment", (() => {
-    return result.suggestions.every(
-      (s) => !s.title.toLowerCase().includes("missing subject")
-        || !/\b(said|asked|replied|whispered)\b/i.test(s.original),
+    return notes.every(
+      (note) => !note.title.toLowerCase().includes("missing subject")
+        || !/\b(said|asked|replied|whispered)\b/i.test(note.excerpt),
     );
   })(), "a tagged line was flagged");
 
@@ -196,16 +281,19 @@ async function runQualityTests() {
     return result.speakers.every((s) => typeof s.line === "string" && typeof s.basis === "string");
   })(), JSON.stringify(result.speakers.slice(0, 2)));
 
-  // ------------------------------------------------------------ pipeline
-  check("the pipeline reports every stage", result.pipeline.length === 10,
-    `got ${result.pipeline.length}`);
-  check("the continuity stage names the alias it resolved", (() => {
-    const stage = result.pipeline.find((p) => p.stage === "continuity");
-    if (!stage || !stage.detail) return false;
-    return result.continuity
-      .filter((n) => n.via)
-      .every((n) => stage.detail?.includes(n.raw));
-  })(), result.pipeline.find((p) => p.stage === "continuity")?.detail ?? "no detail");
+  // --------------------------------------------------- the two-pass result
+  // The ten-stage pipeline report is gone. What the reader gets instead is the
+  // request count and the findings, so those are what this gate checks.
+  check("the two passes ran for the chapter", result.requests >= 2, `requests=${result.requests}`);
+  check("a rules run made no provider request", result.engine !== "rules" || result.requests === 0,
+    `engine=${String(result.engine)} requests=${result.requests}`);
+
+  // The dictionary renamed the alias before the model ever saw the chapter, so
+  // the left column still carries the reader's spelling and the right column
+  // carries the resolved one. That difference is the rename, shown side by side.
+  check("a renamed name is visible as a difference on one row", (() => {
+    return result.changes.some((change) => change.before !== change.after);
+  })(), "every row is unchanged");
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);

@@ -4,53 +4,29 @@ import "server-only";
  * Orchestrates the correction pipeline.
  *
  * Order on every path: continuity normalisation, the model or the local rules,
- * then the speaker attribution pass, which is settled from the text alone.
- * A provider failure is reported back to the client in `fallbackReason` rather
+ * then the speaker attribution pass, which is settled from the text alone. A
+ * provider failure is reported back to the client in `fallbackReason` rather
  * than surfaced as a 500, so the editor always renders a result.
  */
 
 import { configFromRequest } from "./credentials";
+import { alignParagraphs } from "./diff";
 import { LlmError, readLlmConfig, runCorrection } from "./llm";
 import type { LlmProvider } from "./llm";
 import { correctLocally } from "./local-engine";
-import { buildPipelineReport } from "./pipeline";
 import { analysePov, applyPovFixes } from "./pov";
 import { findContinuityNotes, normaliseNames } from "./story-bible";
-import { countWords, readabilityOf, splitSentences } from "./text-stats";
 import type {
-  AnalysisSummary,
+  Change,
   ContinuityNote,
   CorrectionResult,
   IssueCategory,
   PovMode,
-  SpeakerNote,
   StoryBible,
-  Suggestion,
   TonePreset,
 } from "./types";
 
 export { MAX_TEXT_LENGTH, validateRequest } from "./validate";
-
-function summarise(text: string, suggestions: Suggestion[]): AnalysisSummary {
-  const sentences = splitSentences(text);
-  const words = countWords(text);
-
-  const issuesByCategory: Partial<Record<IssueCategory, number>> = {};
-  for (const suggestion of suggestions) {
-    issuesByCategory[suggestion.category] = (issuesByCategory[suggestion.category] ?? 0) + 1;
-  }
-
-  return {
-    wordCount: words,
-    sentenceCount: sentences.length,
-    averageSentenceLength: sentences.length > 0 ? Math.round((words / sentences.length) * 10) / 10 : 0,
-    readability: readabilityOf(text),
-    issuesByCategory,
-  };
-}
-
-/** What a correction path produces before the continuity and report passes run. */
-type PathResult = Omit<CorrectionResult, "continuity" | "pipeline"> & { continuity?: ContinuityNote[] };
 
 /**
  * True when the model belongs to the provider that is actually configured.
@@ -62,6 +38,9 @@ type PathResult = Omit<CorrectionResult, "continuity" | "pipeline"> & { continui
 function providerOwns(provider: LlmProvider, model: string): boolean {
   return provider === "gemini" ? model.startsWith("gemini-") : model.startsWith("gpt-");
 }
+
+/** The result every path returns, before the continuity pass is folded in. */
+type PathResult = Omit<CorrectionResult, "continuity"> & { continuity?: ContinuityNote[] };
 
 export async function correct(
   text: string,
@@ -96,33 +75,35 @@ export async function correct(
       : config;
 
   const finish = (body: PathResult): CorrectionResult => {
-    const continuity = nameNotes.concat(body.continuity ?? []).concat(findContinuityNotes(body.corrected, bible));
+    // Three sources report a name: the rename that ran before the model, the
+    // analyst's own continuity findings, and a scan of the finished chapter for
+    // names the rewrite introduced. The last of these re-reads names the first
+    // already settled, so it contributes only what the others have not covered.
+    // Without that, every settled name is reported a second time as if it had
+    // drifted, and the reader sees the same character listed twice.
+    const reported = new Set(
+      nameNotes.concat(body.continuity ?? []).map((note) => `${note.canonical}:${note.raw.toLowerCase()}`),
+    );
 
-    return {
-      ...body,
-      continuity,
-      pipeline: buildPipelineReport({
-        original: source,
-        corrected: body.corrected,
-        suggestions: body.suggestions,
-        speakers: body.speakers ?? [],
-        continuity,
-        summary: body.summary,
-        bible,
-        povMode,
-        engine: body.engine,
-      }),
-    };
+    const settled = findContinuityNotes(body.corrected, bible).filter(
+      (note) => !reported.has(`${note.canonical}:${note.raw.toLowerCase()}`),
+    );
+
+    return { ...body, continuity: nameNotes.concat(body.continuity ?? []).concat(settled) };
   };
 
   if (!model) {
     const local = correctLocally(source, tone, categories, povMode);
     return finish({
       corrected: local.corrected,
-      suggestions: local.suggestions,
-      summary: local.summary,
+      // The local engine pairs against the text it was handed, which is the
+      // paste with its aliases already resolved, so the left column has to be
+      // rebuilt from the paste. Reverting a rename has to give the reader the
+      // name they typed, and that is only true once the pairing is redone.
+      changes: pairAgainstPaste(text, local.corrected, local.changes),
       speakers: local.speakers,
       engine: "rules",
+      requests: 0,
       fallbackReason: "No LLM_API_KEY is set, so the built-in rules engine handled this pass.",
     });
   }
@@ -133,33 +114,72 @@ export async function correct(
     // Speaker attribution is settled from the text alone, so it runs on every
     // path. The model rewrites prose; it does not reliably track who is talking
     // across a long chapter, and guessing there would corrupt the narration.
-    const pov: { speakers: SpeakerNote[]; suggestions: Suggestion[] } | null =
-      povMode === "off" ? null : analysePov(result.corrected, povMode);
+    const pov = povMode === "off" ? null : analysePov(result.corrected, povMode);
     const corrected =
       pov && povMode === "enforce" ? applyPovFixes(result.corrected, pov.speakers) : result.corrected;
-    const suggestions = result.suggestions.concat(pov?.suggestions ?? []);
 
     return finish({
       corrected,
-      suggestions,
-      summary: summarise(corrected, suggestions),
+      changes:
+        corrected === result.corrected
+          ? pairAgainstPaste(text, corrected, result.changes)
+          : pairAgainstPaste(text, corrected, result.changes).map((change) => ({
+              ...change,
+              after: corrected.includes(change.after) ? change.after : change.before,
+            })),
       speakers: pov?.speakers ?? [],
-      continuity: result.continuity,
       engine: "llm",
       model: model.model,
+      requests: result.requests,
+      continuity: result.continuity,
     });
   } catch (error) {
-    const reason = error instanceof LlmError ? error.message : "The provider request failed.";
+    const reason =
+      error instanceof LlmError
+        ? error.message
+        : "The provider request failed. Check the key and try again.";
+
     const local = correctLocally(source, tone, categories, povMode);
 
     return finish({
       corrected: local.corrected,
-      suggestions: local.suggestions,
-      summary: local.summary,
+      changes: pairAgainstPaste(text, local.corrected, local.changes),
       speakers: local.speakers,
       engine: "rules",
       model: model.model,
+      requests: 0,
       fallbackReason: reason,
     });
   }
+}
+
+/**
+ * Re-pairs the result against the text the reader pasted.
+ *
+ * `runCorrection` and `correctLocally` both build their pairs against the text
+ * the model was handed, which is the paste with every alias already resolved.
+ * The side-by-side view is a promise about the reader's own words, so the left
+ * column is rebuilt here from the paste itself: every paragraph they wrote is
+ * on the left, verbatim, and reverting one puts their wording back.
+ *
+ * Findings and the rewritten side are carried over positionally. The rename and
+ * the rewrite can move text by different amounts, so the similarity fallback in
+ * `alignParagraphs` picks the pairing it trusts most; the notes follow their
+ * paragraph, which is the only place they mean anything.
+ */
+function pairAgainstPaste(pasted: string, corrected: string, changes: Change[]): Change[] {
+  const pairs = alignParagraphs(pasted, corrected);
+
+  return pairs.map((pair) => {
+    // Notes are indexed by position, which is what the analyst and the rules
+    // engine both report against.
+    const from = changes[pair.index];
+    return {
+      index: pair.index,
+      before: pair.before,
+      after: pair.after ?? pair.before,
+      unchanged: pair.unchanged,
+      notes: from?.notes ?? [],
+    };
+  });
 }

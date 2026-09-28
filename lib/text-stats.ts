@@ -257,6 +257,20 @@ export function countWords(text: string): number {
   return matches ? matches.length : 0;
 }
 
+/**
+ * Lowercased, punctuation-free form of a passage, for comparing two versions.
+ *
+ * The diff needs "is this the same paragraph, rewritten" rather than "are these
+ * the same characters", so case, spacing, and trailing marks are dropped.
+ */
+export function normaliseForCompare(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s'’]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export interface Readability {
   score: number;
   label: string;

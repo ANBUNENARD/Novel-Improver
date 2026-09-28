@@ -4,9 +4,9 @@ Paste a chapter, get it back as natural English.
 
 A rephrasing tool for machine-translated novel chapters. You add your OpenAI key
 at the top of the editor, pick a model, paste the chapter, and read the rewrite
-on the right. The pasted text is never overwritten; the improved version is
-assembled beside it, ready to copy or download. Built mobile-first and deployed
-on Vercel.
+paragraph by paragraph beside the one it came from. Each rewrite can be kept or
+undone on its own, and only the kept ones are copied or downloaded. The pasted
+text is never overwritten. Built mobile-first.
 
 ---
 
@@ -62,11 +62,6 @@ See `.env.example` for the full annotated list. The essentials:
 | `LLM_BASE_URL` | No | Any OpenAI-compatible endpoint. Defaults to `https://api.openai.com/v1` |
 | `LLM_MODEL` | No | Model id used when the reader has not picked one in the app. Defaults to `gpt-4o-mini` |
 | `LLM_TIMEOUT_MS` | No | Request timeout. Defaults to `60000` |
-| `SENTRY_DSN` / `NEXT_PUBLIC_SENTRY_DSN` | No | Turns on error reporting |
-| `WEBHOOK_URL_NEWSLETTER` | No | Where `/api/submit` sends newsletter signups |
-| `WEBHOOK_URL_CONTACT` | No | Contact form relay |
-| `WEBHOOK_URL_WAITLIST` | No | Waitlist relay |
-| `WEBHOOK_URL_SCHEDULE` | No | Scheduling form relay |
 | `NEXT_PUBLIC_SITE_URL` | No | Absolute URLs in metadata |
 
 ### Any OpenAI-compatible provider
@@ -86,7 +81,7 @@ The key stays server-side and is never bundled into the client.
 
 There are two ways to supply a key, and they do not conflict:
 
-- **Paste it into the page.** The field labelled `OpenAI key`, at the top of
+- **Paste it into the page.** The field labelled `API key`, at the top of
   the editor, is masked, has a Show toggle, and keeps the value in that
   browser's local storage under `proselens:apiKey`. It is posted with each run
   as `apiKey` and used for that request alone. It is never written to a file or
@@ -142,10 +137,9 @@ the pass.
 
 | Route | Purpose |
 |---|---|
-| `/` | Landing page and the editor |
+| `/` | The editor |
 | `/api/correct` | `POST` — runs the correction pipeline |
 | `/api/health` | `GET` — liveness probe, reports whether the LLM is configured and which models it can reach |
-| `/api/submit` | `POST` — relays forms to the matching webhook |
 | 404 | Not-found page |
 
 ## Scripts
@@ -156,12 +150,12 @@ bun run build          # production build
 bun run start          # serve the production build
 bun run typecheck      # tsc --noEmit
 bun run lint           # eslint
-bun run test:engine    # 109 engine tests, no network or API key needed
-bun run test:quality   # 16 quality checks against a running dev server
+bun run test:engine    # 155 engine tests, no network or API key needed
+bun run test:quality   # 24 quality checks against a running keyed server
 bun run test:routes    # 85 HTTP checks against a running server
-bun run test:llm       # 47 provider checks against the bundled mock
-bun run test:gemini    # 32 checks against the Gemini-shaped mock
-bun run test:ui        # 51 browser checks in headless Chrome
+bun run test:llm       # 70 provider checks against the bundled mock
+bun run test:gemini    # 62 checks against the Gemini-shaped mock
+bun run test:ui        # 67 browser checks in headless Chrome
 ```
 
 ### Browser verification
@@ -208,17 +202,18 @@ so a passing run also proves the system prompt and payload shape are correct.
 
 ## How the correction pipeline works
 
-`lib/engine.ts` orchestrates two paths:
+`lib/engine.ts` chooses between two paths:
 
 1. **LLM path** — when a key is available, either from the request or the
-   environment, `lib/llm.ts` sends the passage with the master prompt and parses
-   the JSON response.
+   environment, `lib/llm.ts` runs the chapter through both passes described
+   below.
 2. **Local path** — `lib/local-engine.ts` applies high-confidence rules only. It
    never guesses at style.
 
 A provider failure (bad key, timeout, unparseable response, HTTP error) falls
 back to the local engine and reports the reason in `fallbackReason`, which the
-UI surfaces. The editor always renders a result; it never hard-fails.
+UI surfaces above the result with a button that retries once the provider
+recovers. The editor always renders a result; it never hard-fails.
 
 The editor runs the pipeline at fixed settings. Tone is `polished`, point of
 view is `detect`, and every issue category is checked. The components for
@@ -227,12 +222,58 @@ list, continuity list, summary strip, suggestion cards, and the story-bible
 panel, which currently ship in the source but are not rendered — re-rendering
 any of them is a matter of adding the element back to `components/editor/editor.tsx`.
 
+### Two passes, always
+
+Every run makes two provider requests, including a single-paragraph paste.
+
+1. **Analyst.** Reads the whole chunk and returns findings only: each one names
+   a paragraph by its zero-based index and quotes an exact excerpt from it,
+   plus what the author meant and, where the problem sits in one phrase, the
+   replacement wording. It also reports the name variants it resolved against
+   the dictionary. Nothing is rewritten in this pass.
+2. **Rewriter.** Receives the original chunk and the findings, and returns the
+   finished chapter. It is free to disagree: a finding that turns out to be
+   wrong leaves the original wording alone, and it also fixes what the analysis
+   missed.
+
+Splitting them is what stops the analysis from being crowded out. When both
+jobs sat inside one completion, the shallower models dropped most of the stages
+and returned prose that ignored the brief.
+
+The continuity dictionary is passed to the analyst only. The rewriter gets the
+findings, never the raw dictionary text, so the names have already been settled
+before it starts writing.
+
+### Long chapters are split
+
+`lib/chunker.ts` splits a chapter on paragraph boundaries into pieces of about
+14,000 characters, which is roughly 3,000-4,000 words per request. A paragraph
+past the 20,000-character ceiling is broken at sentence boundaries, and a
+paragraph under 120 characters is treated as a line of dialogue and kept whole
+so it never separates from the passage it belongs to. Each chunk goes through
+both passes on its own and the results are joined in order, so `requests` in
+the result is two per chunk. The limit is 60,000 characters of input.
+
+### The result is paired back to your paste
+
+`lib/diff.ts` aligns the original and the rewrite paragraph by paragraph, so
+each card in the result shows your own words on the left and the rewrite on the
+right, with the findings attached to the paragraph they came from. The pairing
+is rebuilt from the pasted text on every path, including the fallback, so
+reverting a change gives back the wording you typed rather than a name that was
+already normalised on its way to the model.
+
+A paragraph that came back unchanged is not shown as a card. Every rewritten
+paragraph starts in the kept state, and `Kept` / `Undone` on a card, `Keep all`
+and `Undo all`, plus Copy and Download all operate on that set, so what you
+export is exactly what you left kept.
+
 ### Your chapter is never deleted
 
 The left box holds exactly what you pasted, for the whole session. The improved
-version is assembled on the right, and you can copy or download it whenever you
-are happy with the result. Nothing is written to your draft unless you ask for
-it.
+version is assembled from the cards you kept, and you can copy or download it
+whenever you are happy with the result. Nothing is written to your draft unless
+you ask for it.
 
 ### Who is talking
 
@@ -308,7 +349,9 @@ drawn on the page.
 | `lib/model-output.ts` | Validates and normalises provider JSON |
 | `lib/validate.ts` | Request validation, model allowlist, key cleanup (pure, no server-only) |
 | `lib/credentials.ts` | Builds a request config from a key the reader pasted |
-| `lib/llm.ts` | Provider transport and the web-novel master prompt |
+| `lib/chunker.ts` | Splits a long chapter into one-request pieces |
+| `lib/diff.ts` | Pairs each rewritten paragraph back to the one it came from |
+| `lib/llm.ts` | Provider transport, the analyst prompt, and the rewriter prompt |
 | `lib/pov.ts` | Dialogue extraction, speaker attribution, POV rewrites |
 | `lib/story-bible.ts` | Dictionary parsing, alias normalisation, prompt formatting |
 | `lib/default-bible.ts` | The shipped sample cast and the paste-a-dictionary parser |

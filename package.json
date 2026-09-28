@@ -2,7 +2,7 @@
   "name": "proselens",
   "version": "0.1.0",
   "private": true,
-  "description": "Paste a draft, get a marked-up critique and a corrected rewrite.",
+  "description": "Paste a machine-translated chapter, get it back as natural English with every change shown beside the original.",
   "engines": {
     "node": ">=20.0.0"
   },
@@ -20,9 +20,6 @@
     "test:ui": "bun run scripts/verify-ui.ts"
   },
   "dependencies": {
-    "@gsap/react": "^2.1.2",
-    "@sentry/nextjs": "^8.47.0",
-    "gsap": "^3.12.7",
     "next": "^15.1.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

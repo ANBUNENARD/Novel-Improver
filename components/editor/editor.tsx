@@ -6,12 +6,12 @@
  * The rest of the pipeline runs at fixed settings. Tone is Polished, point of
  * view is read for unclear speakers, every issue category is checked, and the
  * saved character dictionary travels with the chapter so names stay spelled one
- * way across it. Those used to have their own rows of controls; the page is
- * the key, the model, the paste box, and the output now.
+ * way across it.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { DiffView } from "./diff-view";
 import { KeyField } from "./key-field";
 import { ModelPicker } from "./model-picker";
 
@@ -27,19 +27,20 @@ const TONE: TonePreset = "polished";
 /** Speakers are read and reported; nothing is rewritten on their account. */
 const POV_MODE: PovMode = "detect";
 
-const SAMPLE = `It were a quiet morning in the small town of Ashford, and the mist was rolling
-in off the river like it had somewhere important to be.  Sarah was walking down the main
-street with her dog, thinking about the letter she had recieved that morning.  She had
-been thinking about it for days now and she could not shake the feeling that something was
-wrong.  She had not told anyone about it, not even her mother, and she was not planning to.
-The postman came around the corner, and he waved at her, and she waved back, but she
-didnt really see him.  Her mind was elsewhere.  She was thinking about the letter, and what
-it meant, and what she was going to do.  It was a very very long letter and it was going to
-change everything.
+/**
+ * A machine-translated passage, which is what the tool exists to fix: literal
+ * word order, a kinship term applied to the wrong person, a pronoun with no
+ * clear referent, and a speaker tag repeated on every line of dialogue.
+ */
+const SAMPLE = `"Morning," Minjun said, "you are early."
 
-"Morning," Minjun said. "You are early."
-"I am fine," Minjun said.
-"No, you're not," Minjun said.`;
+"It is not nothing," she said, "but it is not nothing."
+
+That is what his father had said, before he had left, and the reason why he had left had never once been said out loud.
+
+"You're early," Minjun said, again.
+
+"You're early," Minjun said.`;
 
 export function Editor() {
   const [text, setText] = useState("");
@@ -47,11 +48,17 @@ export function Editor() {
   // Empty means "use whatever the server is configured with", which is also
   // what happens when the app has no key on either side.
   const [model, setModel] = useState("");
-  const [bible, setBible] = useState<StoryBible>(() => readStoredBible());
+  const [bible, setBible] = useState<StoryBible>({ entries: [] });
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CorrectionResult | null>(null);
+  // Indices of the paragraphs the reader has undone. Held here rather than in
+  // the view so Copy and Download always agree with what is on screen.
+  const [reverted, setReverted] = useState<Set<number>>(new Set());
   const [copied, setCopied] = useState(false);
+  // Set when the model failed and the rules engine answered instead, so the
+  // output can be offered with an honest label and a way to try again.
+  const [degraded, setDegraded] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
@@ -77,6 +84,7 @@ export function Editor() {
 
     setStatus("loading");
     setError(null);
+    setDegraded(false);
 
     try {
       const response = await fetch("/api/correct", {
@@ -101,6 +109,8 @@ export function Editor() {
       }
 
       setResult(payload);
+      setDegraded(Boolean(payload.fallbackReason));
+      setReverted(new Set());
       setStatus("done");
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === "AbortError") return;
@@ -119,29 +129,44 @@ export function Editor() {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
+  /**
+   * The chapter the reader's current keep and undo choices produce.
+   *
+   * A kept paragraph contributes its rewrite, an undone one its original, and a
+   * paragraph the model deleted is restored on undo. The result object keeps the
+   * untouched original text.
+   */
+  const assembled = useMemo(() => {
+    if (!result) return "";
+    return result.changes
+      .map((change) => (reverted.has(change.index) ? change.before : change.after || change.before))
+      .filter((paragraph) => paragraph.length > 0)
+      .join("\n\n");
+  }, [result, reverted]);
+
   const copyOutput = useCallback(async () => {
-    if (!result?.corrected) return;
+    if (!result) return;
     try {
-      await navigator.clipboard.writeText(result.corrected);
+      await navigator.clipboard.writeText(assembled);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
       setError("Clipboard access was blocked by the browser. Select the text and copy manually.");
       setStatus("error");
     }
-  }, [result]);
+  }, [result, assembled]);
 
   const downloadOutput = useCallback(() => {
-    if (!result?.corrected) return;
+    if (!result) return;
 
-    const blob = new Blob([result.corrected], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([assembled], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = "proselens-improved.txt";
     anchor.click();
     URL.revokeObjectURL(url);
-  }, [result]);
+  }, [result, assembled]);
 
   return (
     <div className="space-y-6">
@@ -152,10 +177,12 @@ export function Editor() {
           <ModelPicker value={model} onChange={setModel} />
         </div>
 
-        <p className="border-t border-ink-700 pt-3 text-xs leading-relaxed text-ink-500">
-          Names, aliases, and roles from your saved character dictionary travel with the chapter
-          automatically, so the same person is spelled one way throughout.
-        </p>
+        {bible.entries.length > 0 ? (
+          <p className="border-t border-ink-700 pt-3 text-xs leading-relaxed text-ink-500">
+            {bible.entries.length} names from your saved character dictionary travel with the chapter,
+            so the same person is spelled one way throughout.
+          </p>
+        ) : null}
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -168,6 +195,7 @@ export function Editor() {
                 setText(SAMPLE);
                 setResult(null);
                 setStatus("idle");
+                setDegraded(false);
               }}
               className="text-xs text-ink-400 underline-offset-4 transition-colors hover:text-accent-400 hover:underline"
             >
@@ -199,7 +227,6 @@ export function Editor() {
             <p className="text-center text-xs text-ink-500">
               {words.toLocaleString()} {words === 1 ? "word" : "words"} pasted
             </p>
-
           </div>
         </section>
 
@@ -210,7 +237,7 @@ export function Editor() {
           className="card flex min-h-[26rem] flex-col p-4 sm:p-5"
         >
           <div className="mb-3 flex items-center justify-between gap-3">
-            <h3 className="text-sm font-semibold text-ink-100">Improved chapter</h3>
+            <h3 className="text-sm font-semibold text-ink-100">The rewrite</h3>
 
             {result && status === "done" ? (
               <div className="flex items-center gap-2">
@@ -249,31 +276,43 @@ export function Editor() {
 
           {status === "idle" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 py-16 text-center">
-              <p className="text-sm text-ink-400">Your improved chapter will appear here.</p>
+              <p className="text-sm text-ink-400">The rewrite will appear here, side by side.</p>
               <p className="max-w-xs text-xs text-ink-500">
-                The text you paste stays exactly as you wrote it. This is a separate, rephrased
-                version to copy.
+                The text you paste stays exactly as you wrote it. You keep or undo each paragraph
+                before you copy.
               </p>
             </div>
           ) : null}
 
           {status === "done" && result ? (
             <div className="flex-1 space-y-4">
-              {result.fallbackReason ? (
-                <p className="rounded-lg border border-warn-600/40 bg-warn-500/10 px-3 py-2 text-xs text-warn-400">
-                  {result.fallbackReason}
-                </p>
+              {degraded && result.fallbackReason ? (
+                <div
+                  role="status"
+                  data-testid="fallback-notice"
+                  className="rounded-lg border-2 border-warn-600/60 bg-warn-500/15 p-3"
+                >
+                  <p className="text-sm font-semibold text-warn-400">
+                    This is the local rules engine, not your model.
+                  </p>
+                  <p className="mt-1 break-words text-xs leading-relaxed text-warn-400/90">
+                    {result.fallbackReason}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={run}
+                    className="btn-ghost mt-2 !px-3 !py-1.5 text-xs"
+                  >
+                    Try the model again
+                  </button>
+                </div>
               ) : null}
 
-              <div className="rounded-lg border border-ink-700 bg-ink-900/50 p-4">
-                <p className="prose-editor whitespace-pre-wrap font-serif text-[15px] leading-relaxed text-ink-100">
-                  {result.corrected}
-                </p>
-              </div>
+              <DiffView result={result} reverted={reverted} onRevertedChange={setReverted} />
 
               <p className="text-xs text-ink-500">
-                Your pasted text is untouched. Copy or download this version once you are happy
-                with it.
+                Copy and Download export the paragraphs you kept. Your pasted text is never
+                overwritten.
               </p>
             </div>
           ) : null}
@@ -281,8 +320,8 @@ export function Editor() {
       </div>
 
       <p className="text-center text-xs text-ink-500">
-        The chapter is sent to the model you picked for a single pass, then discarded. Your API
-        key stays in this browser and is never written to a file or a server log.
+        The chapter is sent to the model you picked, then discarded. Your API key stays in this
+        browser and is never written to a file or a server log.
       </p>
     </div>
   );

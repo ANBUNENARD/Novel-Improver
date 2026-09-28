@@ -1,99 +1,40 @@
 /**
- * The shipped story bible and the parser that fills it in from pasted text.
+ * The story dictionary the editor reads, and the parser that fills one in from
+ * pasted text.
  *
- * The default is the dictionary from the workflow document, so the panel is
- * populated the moment a new novel project is opened. `parseBibleText` reads
- * the same format back, which means a dictionary can be typed by hand, pasted
- * from the document, or edited in the panel and round-tripped through storage.
+ * There is no shipped cast. A dictionary used to be built into this file from
+ * one specific novel, which meant every chapter pasted into a browser with an
+ * empty store was silently rewritten against thirteen characters who have
+ * nothing to do with it. The only dictionary now is the reader's own, saved in
+ * this browser; when there is none, the engine runs without one and the prompt
+ * carries nothing to be biased by.
+ *
+ * `parseBibleText` reads the same format back, so a dictionary can be typed by
+ * hand or pasted from a project document.
  */
 
 import type { BibleEntry, BibleEntryKind, StoryBible } from "./types";
 import { normaliseBible, normaliseEntry } from "./story-bible";
 
-interface Seed {
-  kind: BibleEntryKind;
-  name: string;
-  aliases?: string[];
-  gender?: "male" | "female" | "other";
-  role?: string;
-}
-
-/** The project dictionary, ordered as the document lists it. */
-const SEED: Seed[] = [
-  {
-    kind: "character",
-    name: "Licht",
-    gender: "male",
-    role: "first-person protagonist; real name Lee Soo-hyun; Pure Black Knight; Hero of Conviction",
-  },
-  {
-    kind: "character",
-    name: "Phine",
-    aliases: ["Phine Grancia", "Mardol"],
-    gender: "female",
-    role: "Glass Knight; Nameless Saintess on the relevant alternate routes",
-  },
-  { kind: "character", name: "Chartiness", gender: "female", role: "Second Saintess; vampire" },
-  { kind: "character", name: "Kainel", gender: "male", role: "Hero; Ariel's childhood friend and love interest" },
-  { kind: "character", name: "Ariel", gender: "female", role: "red-haired elf mage" },
-  {
-    kind: "character",
-    name: "Nex",
-    gender: "male",
-    role: "purple-haired spirit user; descendant of Asha Aureus",
-  },
-  { kind: "character", name: "Asha Aureus", gender: "female", role: "Living Sun; Duke of House Aureus" },
-  { kind: "character", name: "Laplace", gender: "male", role: "Great Magician; Academy president" },
-  { kind: "character", name: "Head Acher", role: "Demon King of Omniscience" },
-  { kind: "term", name: "Giyu", role: "Licht's personal sword" },
-  { kind: "location", name: "Temple of Tarden" },
-  { kind: "location", name: "Library of Truth" },
-  { kind: "organisation", name: "Heroic Cult" },
-];
-
-function seedEntries(): BibleEntry[] {
-  return SEED.map((seed, index) =>
-    normaliseEntry({
-      id: `seed${index + 1}`,
-      kind: seed.kind,
-      name: seed.name,
-      aliases: seed.aliases ?? [],
-      gender: seed.gender,
-      role: seed.role,
-    })!,
-  );
-}
-
-let cached: StoryBible | null = null;
-
-/** The shipped dictionary. Built once and returned by reference. */
-export function defaultBible(): StoryBible {
-  if (cached === null) {
-    cached = { entries: seedEntries() };
-  }
-  return cached;
-}
-
 /** Local-storage key the editor keeps a project's own cast under. */
 export const BIBLE_STORAGE_KEY = "proselens:story-bible:v1";
 
 /**
- * The dictionary saved in this browser, or the shipped one.
+ * The dictionary saved in this browser, or an empty one.
  *
- * The panel that used to edit this dictionary is gone, so the entries are only
- * ever read here. Anything unreadable falls back to the shipped cast, which is
- * the behaviour the editor had before a project overwrote it.
+ * Nothing is invented when the store is empty or unreadable: an empty
+ * dictionary is the correct state for a reader who has not made one, and the
+ * engine treats it the same as running without one.
  */
 export function readStoredBible(): StoryBible {
-  if (typeof window === "undefined") return defaultBible();
+  if (typeof window === "undefined") return { entries: [] };
 
   try {
     const raw = window.localStorage.getItem(BIBLE_STORAGE_KEY);
-    if (!raw) return defaultBible();
-    const parsed = normaliseBible(JSON.parse(raw));
-    return parsed.entries.length > 0 ? parsed : defaultBible();
+    if (!raw) return { entries: [] };
+    return normaliseBible(JSON.parse(raw));
   } catch {
-    return defaultBible();
+    return { entries: [] };
   }
 }
 

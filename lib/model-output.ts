@@ -3,9 +3,12 @@
  *
  * Kept free of `server-only` so the test harness and any future non-server
  * caller can reach it. The transport lives in llm.ts; this is just the parser.
+ *
+ * There are two readers, one per pass: the analyst's list of findings and the
+ * rewriter's chapter.
  */
 
-import type { ContinuityNote, IssueCategory, Suggestion } from "./types";
+import type { AnalysisNote, ContinuityNote, IssueCategory } from "./types";
 import { ISSUE_CATEGORIES } from "./types";
 
 /** Strips markdown fences some providers wrap JSON in. */
@@ -30,35 +33,64 @@ export class LlmError extends Error {
   }
 }
 
-function normaliseSuggestion(entry: unknown, index: number): Suggestion | null {
+function parseJson(content: string): Record<string, unknown> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(stripCodeFences(content));
+  } catch {
+    throw new LlmError("Provider response was not valid JSON");
+  }
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new LlmError("Provider response was not a JSON object");
+  }
+
+  return raw as Record<string, unknown>;
+}
+
+function readCategory(value: unknown): IssueCategory {
+  return typeof value === "string" && (ISSUE_CATEGORIES as string[]).includes(value)
+    ? (value as IssueCategory)
+    : "grammar";
+}
+
+/**
+ * Reads one finding from the analyst pass.
+ *
+ * A note with no excerpt cannot be tied to a place in the passage, and one with
+ * no paragraph index cannot be tied to a paragraph, so both are required. The
+ * paragraph index is clamped rather than dropped: a model that reports index
+ * 400 for a three-paragraph chapter meant the last one.
+ */
+function normaliseNote(entry: unknown, paragraphCount: number): AnalysisNote | null {
   if (!entry || typeof entry !== "object") return null;
 
   const record = entry as Record<string, unknown>;
-  const original = typeof record.original === "string" ? record.original : "";
-  const suggestion = typeof record.suggestion === "string" ? record.suggestion : "";
+  const excerpt = typeof record.excerpt === "string" ? record.excerpt.trim() : "";
+  if (!excerpt) return null;
 
-  // An entry with no source text cannot be applied to the passage.
-  if (!original || !suggestion) return null;
-
-  const rawCategory = typeof record.category === "string" ? record.category : "grammar";
-  const category = (ISSUE_CATEGORIES as string[]).includes(rawCategory)
-    ? (rawCategory as IssueCategory)
-    : "grammar";
+  const rawParagraph = typeof record.paragraph === "number" ? Math.trunc(record.paragraph) : 0;
+  const paragraph = Math.max(0, Math.min(paragraphCount - 1, rawParagraph));
 
   const title =
     typeof record.title === "string" && record.title.trim()
       ? record.title.trim()
-      : "Suggested revision";
+      : "Needs rewriting";
 
-  const note = typeof record.note === "string" && record.note.trim() ? record.note.trim() : undefined;
+  const intended =
+    typeof record.intended === "string" && record.intended.trim()
+      ? record.intended.trim()
+      : "The literal wording does not carry the meaning the scene supports.";
+
+  const rewrite = typeof record.rewrite === "string" ? record.rewrite.trim() : "";
 
   return {
-    id: `s${index + 1}`,
-    category,
+    paragraph,
+    category: readCategory(record.category),
     title,
-    original,
-    suggestion,
-    ...(note ? { note } : {}),
+    excerpt,
+    intended,
+    rewrite,
   };
 }
 
@@ -86,44 +118,52 @@ function normaliseContinuity(entry: unknown): ContinuityNote | null {
 }
 
 /**
- * Parses and validates the provider's JSON payload.
+ * Reads the analyst's output.
  *
- * Throws `LlmError` when the response is unusable so the caller can fall back
- * to the local engine rather than rendering a half-built result.
+ * `paragraphCount` is the number of paragraphs in the passage that was sent, so
+ * an index the model invented can be pulled back to the last paragraph instead
+ * of being dropped. A malformed note is skipped rather than failing the pass,
+ * because a partial list of findings still produces a usable rewrite. The
+ * rewrite pass is the one that has to succeed; this one only has to help.
  */
-export function parseModelOutput(content: string): {
-  corrected: string;
-  suggestions: Suggestion[];
+export function parseAnalysis(
+  content: string,
+  paragraphCount: number,
+): {
+  notes: AnalysisNote[];
   continuity: ContinuityNote[];
 } {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(stripCodeFences(content));
-  } catch {
-    throw new LlmError("Provider response was not valid JSON");
-  }
+  const record = parseJson(content);
 
-  if (!raw || typeof raw !== "object") {
-    throw new LlmError("Provider response was not a JSON object");
-  }
-
-  const record = raw as { corrected?: unknown; suggestions?: unknown; continuity?: unknown };
-  const corrected = typeof record.corrected === "string" ? record.corrected.trim() : "";
-
-  if (!corrected) {
-    throw new LlmError("Provider response omitted the corrected passage");
-  }
-
-  const suggestions = Array.isArray(record.suggestions) ? record.suggestions : [];
-  const continuity = Array.isArray(record.continuity) ? record.continuity : [];
+  const rawNotes = Array.isArray(record.notes) ? record.notes : [];
+  const rawContinuity = Array.isArray(record.continuity) ? record.continuity : [];
+  const limit = Math.max(1, Math.trunc(paragraphCount));
 
   return {
-    corrected,
-    suggestions: suggestions
-      .map((entry, index) => normaliseSuggestion(entry, index))
-      .filter((entry): entry is Suggestion => entry !== null),
-    continuity: continuity
+    notes: rawNotes
+      .map((entry) => normaliseNote(entry, limit))
+      .filter((note): note is AnalysisNote => note !== null)
+      .slice(0, 60),
+    continuity: rawContinuity
       .map((entry) => normaliseContinuity(entry))
       .filter((entry): entry is ContinuityNote => entry !== null),
   };
+}
+
+/**
+ * Reads the rewriter's output.
+ *
+ * Unlike the analysis, a missing chapter throws: there is nothing to fall back
+ * to inside a single pass, and the caller decides whether the whole request
+ * falls back to the local engine.
+ */
+export function parseRewrite(content: string): { corrected: string } {
+  const record = parseJson(content);
+  const corrected = typeof record.corrected === "string" ? record.corrected.trim() : "";
+
+  if (!corrected) {
+    throw new LlmError("Provider response omitted the corrected chapter");
+  }
+
+  return { corrected };
 }

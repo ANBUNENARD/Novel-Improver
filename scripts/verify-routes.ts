@@ -43,6 +43,21 @@ async function verifyRoutes() {
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   }
 
+  // The findings the reader reads sit on the change they belong to, so the two
+  // helpers below reach into the change list rather than a flat array. The cast
+// is deliberate: this is a verification script, and the point of the checks is
+  // to catch the server sending the wrong shape.
+  type Note = { paragraph: number; category: string; title: string; excerpt: string; intended: string; rewrite: string };
+  type Entry = { index: number; before: string; after: string; unchanged: boolean; notes: Note[] };
+
+  function correctedChanges(body: Record<string, unknown>): Entry[] {
+    return body.changes as Entry[];
+  }
+
+  function notesOf(body: Record<string, unknown>): Note[] {
+    return correctedChanges(body).flatMap((change) => change.notes ?? []);
+  }
+
   // ------------------------------------------------------------- page routes
   section("pages");
 
@@ -51,7 +66,6 @@ async function verifyRoutes() {
 
   check("GET / returns 200", home.status === 200, `status ${home.status}`);
   check("home renders the brand", homeHtml.includes("ProseLens"));
-  check("home has the paste affordance", homeHtml.includes("Paste a draft"));
   check("home has the editor textarea", homeHtml.includes('id="draft"'));
   // The editor is the api key, the model, the paste box, and the output. The
   // tone and point-of-view rows used to sit between the paste box and the
@@ -62,7 +76,13 @@ async function verifyRoutes() {
   check("home has the model picker", homeHtml.includes("model"));
   check("home runs the tone and pov at fixed settings", !homeHtml.includes("Faithful"));
   check("home has the sample loader", homeHtml.includes("Load a sample"));
-  check("home has the FAQ section", homeHtml.includes('id="faq"'));
+  // The page is the editor and its explanation. The marketing sections used to
+  // sit around it, and a silent re-render of one would pass as a healthy page.
+  check("home has the editor heading", homeHtml.includes("Improve a chapter"));
+  check("home has no FAQ section", !homeHtml.includes('id="faq"'));
+  check("home has no how-it-works section", !homeHtml.includes('id="how"'));
+  check("home has no waitlist form", !homeHtml.includes('id="waitlist-email"'));
+  check("home has no nav links", !homeHtml.includes("How it works"));
   check("home declares the html lang attribute", homeHtml.includes('<html lang="en"'));
   check("home is not an error page", !homeHtml.includes("Application error"));
 
@@ -147,27 +167,61 @@ async function verifyRoutes() {
     corrected.body.engine !== "rules" || String(corrected.body.corrected).includes("couldn't"),
     `engine=${String(corrected.body.engine)}`,
   );
-  check("suggestions are returned", (corrected.body.suggestions as unknown[]).length > 0);
+  // The side-by-side view is driven by one change per pasted paragraph. A
+  // single-paragraph paste is the shape the UI most often sees, so the field
+  // set is asserted against it.
+  const changes = corrected.body.changes as Array<Record<string, unknown>>;
+  check("changes are returned", changes.length > 0, `changes=${changes.length}`);
   check(
-    "every suggestion has the fields the card renders",
-    (corrected.body.suggestions as Array<Record<string, unknown>>).every(
+    "one change per pasted paragraph",
+    changes.length === messy.split(/\n{2,}/).filter(Boolean).length,
+    `changes=${changes.length}`,
+  );
+  check(
+    "every change has the fields the side-by-side view renders",
+    changes.every(
       (item) =>
-        typeof item.id === "string" &&
-        typeof item.category === "string" &&
-        typeof item.original === "string" &&
-        typeof item.suggestion === "string",
+        typeof item.index === "number" &&
+        typeof item.before === "string" &&
+        typeof item.after === "string" &&
+        typeof item.unchanged === "boolean" &&
+        Array.isArray(item.notes),
     ),
-  );
-  check("summary has a word count", (corrected.body.summary as { wordCount: number }).wordCount > 0);
-  check(
-    "summary has a sentence count",
-    (corrected.body.summary as { sentenceCount: number }).sentenceCount > 0,
+    JSON.stringify(changes[0]),
   );
   check(
-    "summary has a readability score",
-    (corrected.body.summary as { readability: { score: number } }).readability.score >= 0,
+    "the first change carries the pasted paragraph on the left",
+    changes[0]?.before === messy,
+    String(changes[0]?.before),
+  );
+  check(
+    "change indices are positions in the chapter",
+    changes.every((item, position) => item.index === position),
+    JSON.stringify(changes.map((item) => item.index)),
+  );
+  check(
+    "findings reach the reader beside the rewrite",
+    (changes[0]?.notes as Array<Record<string, unknown>>).some(
+      (note) =>
+        typeof note.category === "string" &&
+        typeof note.title === "string" &&
+        typeof note.excerpt === "string" &&
+        typeof note.intended === "string" &&
+        typeof note.rewrite === "string",
+    ),
+    JSON.stringify(changes[0]?.notes),
   );
   check("engine is reported", corrected.body.engine === "llm" || corrected.body.engine === "rules");
+  check(
+    "the number of provider requests is reported",
+    typeof corrected.body.requests === "number" && (corrected.body.requests as number) >= 0,
+    String(corrected.body.requests),
+  );
+  check(
+    "a rules run made no provider request",
+    corrected.body.engine !== "rules" || corrected.body.requests === 0,
+    `engine=${String(corrected.body.engine)} requests=${String(corrected.body.requests)}`,
+  );
   check(
     "a rules fallback explains itself",
     corrected.body.engine !== "rules" || Boolean(corrected.body.fallbackReason),
@@ -256,6 +310,12 @@ async function verifyRoutes() {
   // Two exchanges: the first is three tagged lines from one speaker, the second
   // is a tag followed by a bare line. Both avoid the words the contraction rules
   // rewrite, so the POV pass is the only thing that can change them.
+  //
+  // This block is written for the rules path, which is what a reader gets when
+  // no key is set. Against a running mock provider the fixture comes back
+  // rewritten, so the prose assertions are skipped there; the speaker and finding
+  // checks run either way.
+  const rulesOnly = !healthBody.llm.configured;
   const repeated = `"Enough, then," Minjun said.\n"No, you cannot know," Minjun said.\n"Fine. Whatever." Minjun said.`;
   const carryOver = `"Get out," Minjun said.\n"Where should I go?"`;
 
@@ -274,12 +334,13 @@ async function verifyRoutes() {
   );
   check(
     "pov off leaves the text alone",
-    povOff.body.corrected === `${repeated}\n${carryOver}`,
-    String(povOff.body.corrected),
+    !rulesOnly || povOff.body.corrected === `${repeated}\n${carryOver}`,
+    `engine=${String(povOff.body.engine)} ${String(povOff.body.corrected).slice(0, 60)}`,
   );
   check(
-    "pov off returns no pov suggestions",
-    (povOff.body.suggestions as Array<{ category: string }>).every((item) => item.category !== "pov"),
+    "pov off returns no pov findings",
+    !rulesOnly || notesOf(povOff.body).every((note) => note.category !== "pov"),
+    `engine=${String(povOff.body.engine)} ${JSON.stringify(notesOf(povOff.body))}`,
   );
 
   const povDetect = await post("/api/correct", {
@@ -292,7 +353,13 @@ async function verifyRoutes() {
   const detectedSpeakers = povDetect.body.speakers as Array<Record<string, unknown>>;
 
   check("pov detect returns 200", povDetect.status === 200, `status ${povDetect.status}`);
-  check("pov detect names a speaker per line", detectedSpeakers.length === 5, `got ${detectedSpeakers.length}`);
+  // A model rewrite is free to merge or drop a line, so the exact line count
+  // belongs to the rules path. The attribution itself is checked either way.
+  check(
+    "pov detect names a speaker per dialogue line",
+    !rulesOnly || detectedSpeakers.length === 5,
+    `got ${detectedSpeakers.length}`,
+  );
   check(
     "pov detect resolves the tagged line to its name",
     detectedSpeakers[0]?.speaker === "Minjun" && detectedSpeakers[0]?.basis === "tag",
@@ -300,8 +367,8 @@ async function verifyRoutes() {
   );
   check(
     "pov detect carries the speaker onto a bare line",
-    detectedSpeakers[4]?.speaker === "Minjun" && detectedSpeakers[4]?.basis === "carried",
-    JSON.stringify(detectedSpeakers[4]),
+    !rulesOnly || (detectedSpeakers[4]?.speaker === "Minjun" && detectedSpeakers[4]?.basis === "carried"),
+    `got ${detectedSpeakers.length} speakers: ${JSON.stringify(detectedSpeakers.map((item) => item.basis))}`,
   );
   check(
     "pov speakers carry the fields the list renders",
@@ -315,14 +382,15 @@ async function verifyRoutes() {
   );
   check(
     "pov detect changes no text",
-    povDetect.body.corrected === `${repeated}\n${carryOver}`,
-    String(povDetect.body.corrected),
+    !rulesOnly || povDetect.body.corrected === `${repeated}\n${carryOver}`,
+    `engine=${String(povDetect.body.engine)}`,
   );
   check(
     "pov detect reports the repeated tag without rewriting it",
-    (povDetect.body.suggestions as Array<{ category: string; title: string }>).some(
-      (item) => item.category === "pov" && item.title === "Speaker name repeated on every line",
+    notesOf(povDetect.body).some(
+      (note) => note.category === "pov" && note.title === "Speaker name repeated on every line",
     ),
+    JSON.stringify(notesOf(povDetect.body)),
   );
 
   const povEnforce = await post("/api/correct", {
@@ -332,34 +400,35 @@ async function verifyRoutes() {
     povMode: "enforce",
   });
 
-  const povSuggestions = povEnforce.body.suggestions as Array<Record<string, unknown>>;
+  const povNotes = notesOf(povEnforce.body);
 
   check("pov enforce returns 200", povEnforce.status === 200, `status ${povEnforce.status}`);
   check(
     "pov enforce keeps the tag the reader needs as an anchor",
-    String(povEnforce.body.corrected).startsWith('"Enough, then," Minjun said.\n'),
-    String(povEnforce.body.corrected),
+    !rulesOnly || String(povEnforce.body.corrected).startsWith('"Enough, then," Minjun said.\n'),
+    `engine=${String(povEnforce.body.engine)} ${String(povEnforce.body.corrected).slice(0, 60)}`,
   );
   check(
     "pov enforce drops the repeated tag and closes the sentence",
-    String(povEnforce.body.corrected).includes('"No, you cannot know."\n'),
-    String(povEnforce.body.corrected),
+    !rulesOnly || String(povEnforce.body.corrected).includes('"No, you cannot know."\n'),
+    `engine=${String(povEnforce.body.engine)}`,
   );
   check(
     "pov enforce does not add a second full stop",
-    String(povEnforce.body.corrected).endsWith('"Fine. Whatever."'),
-    String(povEnforce.body.corrected),
+    !rulesOnly || String(povEnforce.body.corrected).endsWith('"Fine. Whatever."'),
+    `engine=${String(povEnforce.body.engine)}`,
   );
   check(
-    "pov enforce reports the change as a pov suggestion",
-    povSuggestions.some((item) => item.category === "pov" && String(item.title).includes("speaker")),
-    JSON.stringify(povSuggestions.filter((item) => item.category === "pov")),
+    "pov enforce reports the change as a pov finding",
+    povNotes.some((note) => note.category === "pov" && note.title.toLowerCase().includes("speaker")),
+    JSON.stringify(povNotes.filter((note) => note.category === "pov")),
   );
   check(
-    "every pov suggestion explains itself",
-    povSuggestions
-      .filter((item) => item.category === "pov")
-      .every((item) => String(item.note).length > 0 && String(item.title).length > 0),
+    "every pov finding explains itself",
+    povNotes
+      .filter((note) => note.category === "pov")
+      .every((note) => note.intended.length > 0 && note.title.length > 0),
+    JSON.stringify(povNotes.filter((note) => note.category === "pov")),
   );
 
   const povNoise = await post("/api/correct", {
@@ -375,8 +444,8 @@ async function verifyRoutes() {
     JSON.stringify(povNoise.body.speakers),
   );
 
-  // ------------------------------------------------- story bible and pipeline
-  section("story bible and pipeline");
+  // ------------------------------------------------- story bible and continuity
+  section("story bible and continuity");
 
   const bible = {
     entries: [
@@ -432,31 +501,25 @@ async function verifyRoutes() {
     JSON.stringify(continuity.map((note) => note.context)),
   );
 
-  const pipeline = withBible.body.pipeline as Array<{ stage: string; ran: boolean; detail: string }>;
+  // The ten-stage pipeline report is gone. What replaced it is the change
+  // list, so the alias resolution has to be visible there: the reader sees the
+  // renamed paragraph and the note that explains it.
+  const bibleChanges = correctedChanges(withBible.body);
   check(
-    "the response carries the ten-stage report",
-    Array.isArray(pipeline) && pipeline.length === 10,
-    String(Array.isArray(pipeline) ? pipeline.length : pipeline),
+    "the renamed paragraph is shown side by side",
+    bibleChanges[0]?.after.startsWith("Phine raised her glass mask."),
+    String(bibleChanges[0]?.after).slice(0, 80),
   );
   check(
-    "the stages are in the documented order",
-    pipeline?.map((entry) => entry.stage).join(",") ===
-      "parse,pov,normalize,continuity,meaning,rewrite,pacing,dialogue,logic,consistency",
-    pipeline?.map((entry) => entry.stage).join(","),
+    "the reader sees their own pasted name on the left and the resolved one on the right",
+    String(bibleChanges[0]?.before).includes("Mardol") &&
+      String(bibleChanges[0]?.after).includes("Phine"),
+    `${String(bibleChanges[0]?.before).slice(0, 60)} -> ${String(bibleChanges[0]?.after).slice(0, 60)}`,
   );
   check(
-    "every stage has a detail line",
-    pipeline?.every((entry) => typeof entry.detail === "string" && entry.detail.length > 0),
-  );
-  check(
-    "the names stage counts the matches",
-    pipeline?.find((entry) => entry.stage === "normalize")?.detail?.includes("2 names") === true,
-    pipeline?.find((entry) => entry.stage === "normalize")?.detail,
-  );
-  check(
-    "the continuity stage names the alias it resolved",
-    pipeline?.find((entry) => entry.stage === "continuity")?.detail?.includes("Mardol") === true,
-    pipeline?.find((entry) => entry.stage === "continuity")?.detail,
+    "the number of provider requests is reported with the result",
+    typeof withBible.body.requests === "number",
+    String(withBible.body.requests),
   );
 
   // A missing dictionary is the same as running without one, and a malformed
@@ -475,8 +538,8 @@ async function verifyRoutes() {
     String(noBible.body.corrected),
   );
   check(
-    "no dictionary still returns a pipeline report",
-    (noBible.body.pipeline as unknown[]).length === 10,
+    "no dictionary still returns changes",
+    (noBible.body.changes as unknown[]).length > 0,
   );
   check(
     "no dictionary reports no matches",
@@ -497,38 +560,8 @@ async function verifyRoutes() {
     );
   }
 
-  // ------------------------------------------------------------- api/submit
-  section("api/submit");
-
-  const newsletter = await post("/api/submit", { form: "newsletter", email: "reader@example.com" });
-  check("newsletter submit returns 200", newsletter.status === 200, `status ${newsletter.status}`);
-  check("newsletter submit is ok", newsletter.body.ok === true);
-
-  const unknownForm = await post("/api/submit", { form: "not-a-form", email: "x@example.com" });
-  check("unknown form returns 400", unknownForm.status === 400, `status ${unknownForm.status}`);
-
-  const badEmail = await post("/api/submit", {
-    form: "contact",
-    email: "not-an-email",
-    message: "Hello",
-  });
-  check("invalid contact email returns 400", badEmail.status === 400, `status ${badEmail.status}`);
-
-  const noMessage = await post("/api/submit", {
-    form: "contact",
-    email: "reader@example.com",
-  });
-  check("contact without a message returns 400", noMessage.status === 400, `status ${noMessage.status}`);
-
-  const honeypot = await post("/api/submit", {
-    form: "newsletter",
-    email: "bot@example.com",
-    website: "http://spam",
-  });
-  check(
-    "honeypot submission is silently dropped",
-    honeypot.status === 200 && honeypot.body.delivered === false,
-  );
+  // The waitlist form and the webhook it posted to are gone: the page is now
+  // the editor and nothing else, so there is no form left to relay.
 
   // ------------------------------------------------------------------ report
   console.log(`\n${passed} passed, ${failed} failed\n`);
