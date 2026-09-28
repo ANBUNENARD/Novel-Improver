@@ -1,0 +1,174 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-50: oklch(0.985 0.002 260);
+  --color-ink-100: oklch(0.96 0.004 260);
+  --color-ink-200: oklch(0.9 0.006 260);
+  --color-ink-300: oklch(0.8 0.008 260);
+  --color-ink-400: oklch(0.62 0.012 260);
+  --color-ink-500: oklch(0.5 0.014 260);
+  --color-ink-600: oklch(0.42 0.016 260);
+  --color-ink-700: oklch(0.32 0.018 262);
+  --color-ink-800: oklch(0.22 0.02 264);
+  --color-ink-900: oklch(0.15 0.022 266);
+  --color-ink-950: oklch(0.1 0.024 268);
+
+  --color-accent-300: oklch(0.82 0.11 195);
+  --color-accent-400: oklch(0.72 0.13 194);
+  --color-accent-500: oklch(0.62 0.14 193);
+  --color-accent-600: oklch(0.53 0.13 193);
+
+  --color-warn-400: oklch(0.8 0.14 78);
+  --color-warn-500: oklch(0.72 0.15 72);
+  --color-warn-600: oklch(0.62 0.14 66);
+
+  --color-good-400: oklch(0.78 0.13 158);
+  --color-good-500: oklch(0.68 0.14 157);
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: var(--font-newsreader), ui-serif, Georgia, Cambria, "Times New Roman", serif;
+
+  --radius-card: 1rem;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-100);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* The editor surfaces hold a lot of text; keep long words from overflowing. */
+  .prose-editor {
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklch, var(--color-accent-500) 35%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent-400);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .card {
+    background-color: color-mix(in oklch, var(--color-ink-800) 70%, transparent);
+    border: 1px solid var(--color-ink-700);
+    border-radius: var(--radius-card);
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    background-color: var(--color-accent-500);
+    color: var(--color-ink-950);
+    font-weight: 600;
+    border-radius: 0.75rem;
+    padding: 0.75rem 1.25rem;
+    transition: background-color 150ms ease, transform 150ms ease, opacity 150ms ease;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--color-accent-400);
+  }
+
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border: 1px solid var(--color-ink-600);
+    color: var(--color-ink-200);
+    border-radius: 0.75rem;
+    padding: 0.625rem 1rem;
+    transition: border-color 150ms ease, color 150ms ease, background-color 150ms ease;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    border-color: var(--color-ink-400);
+    color: var(--color-ink-50);
+    background-color: color-mix(in oklch, var(--color-ink-800) 60%, transparent);
+  }
+
+  .input {
+    width: 100%;
+    border: 1px solid var(--color-ink-700);
+    background-color: color-mix(in oklch, var(--color-ink-950) 60%, transparent);
+    border-radius: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.875rem;
+    color: var(--color-ink-100);
+    transition: border-color 150ms ease;
+  }
+
+  .input::placeholder {
+    color: var(--color-ink-500);
+  }
+
+  .input:focus {
+    border-color: var(--color-accent-500);
+    outline: none;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    border: 1px solid var(--color-ink-600);
+    border-radius: 9999px;
+    padding: 0.3rem 0.75rem;
+    font-size: 0.8125rem;
+    line-height: 1.2;
+    color: var(--color-ink-300);
+    transition: all 150ms ease;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .chip:hover {
+    border-color: var(--color-ink-400);
+    color: var(--color-ink-100);
+  }
+
+  .chip[data-active="true"] {
+    background-color: color-mix(in oklch, var(--color-accent-500) 18%, transparent);
+    border-color: var(--color-accent-500);
+    color: var(--color-accent-300);
+  }
+}
